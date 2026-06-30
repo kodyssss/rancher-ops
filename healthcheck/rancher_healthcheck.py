@@ -1,21 +1,27 @@
 #!/usr/bin/env python3
 """
-rancher_healthcheck.py — Rancher 集群巡检
-==========================================
+rancher_healthcheck.py — Rancher 集群巡检 (完整版)
+====================================================
 巡检 local 集群 + 所有下游集群的健康状态。
 
 检查项:
-  🔍 集群状态      — 是否 active、conditions 是否全部正常
-  🔍 节点健康      — 节点 Ready/资源压力/K8s版本一致性
-  🔍 项目巡检      — 项目状态、无成员项目、空项目
+  🔍 集群状态      — Active/Ready、K8s版本、Provider 类型
+  🔍 控制平面      — etcd/scheduler/controller-manager 健康
+  🔍 节点健康      — Ready、资源压力(CPU/Mem/Disk/PID)、版本一致性
+  🔍 CNI 巡检      — CNI 类型、DaemonSet 就绪状态
+  🔍 CSI 巡检      — StorageClass、CSI 驱动、PVC 状态
+  🔍 系统组件      — CoreDNS、Ingress、Metrics-server 健康
+  🔍 工作负载      — Deployment/DaemonSet 副本状态、高重启 Pod
   🔍 RBAC 概览     — 各角色用户/组数量
-  🔍 风险提示      — 汇总所有不健康的项
+  🔍 事件          — 最近 Warning 事件
+  🔍 风险汇总      — 汇总所有不健康的项
 
 用法:
   python3 rancher_healthcheck.py              # 终端报告
   python3 rancher_healthcheck.py -o report.md # 输出 Markdown
   python3 rancher_healthcheck.py -c poc       # 只查某集群
   python3 rancher_healthcheck.py --json       # JSON 格式
+  python3 rancher_healthcheck.py --no-deep    # 跳过 k8s API 深度检查
 
 env 文件: 同目录 env.txt
 """
@@ -41,10 +47,37 @@ SSL_CTX.check_hostname = False
 SSL_CTX.verify_mode = ssl.CERT_NONE
 
 # ── 风险等级 ──
-CRITICAL = "🔴 CRITICAL"
-WARNING  = "🟡 WARNING"
-INFO     = "🟢 INFO"
-OK       = "✅ OK"
+CRITICAL = "CRITICAL"
+WARNING  = "WARNING"
+INFO     = "INFO"
+OK       = "OK"
+
+LEVEL_ICON = {CRITICAL: "🔴", WARNING: "🟡", INFO: "🟢", OK: "✅"}
+
+# ── 已知 CNI DaemonSet 名称模式 ──
+CNI_PATTERNS = [
+    ("canal",         "Canal (Flannel + Calico)"),
+    ("calico-node",   "Calico"),
+    ("flannel",       "Flannel"),
+    ("cilium",        "Cilium"),
+    ("weave-net",     "Weave Net"),
+    ("kube-router",   "Kube-router"),
+    ("antrea-agent",  "Antrea"),
+]
+
+# ── 已知 CSI DaemonSet 名称模式 ──
+CSI_PATTERNS = [
+    ("longhorn",          "Longhorn"),
+    ("csi",               "CSI"),
+    ("ebs-csi",           "AWS EBS"),
+    ("efs-csi",           "AWS EFS"),
+    ("vsphere-csi",       "vSphere"),
+    ("nfs-csi",           "NFS"),
+    ("rook-ceph",         "Rook Ceph"),
+    ("cinder-csi",        "OpenStack Cinder"),
+]
+CSI_NS = ("kube-system", "longhorn-system", "cattle-system", "rook-ceph",
+          "vmware-system-csi")
 
 
 def load_env(env_path=None):
@@ -91,7 +124,7 @@ def api_get(url, token, path):
             resp = urlopen(req, timeout=REQUEST_TIMEOUT, context=SSL_CTX)
             return json.loads(resp.read().decode("utf-8"))
         except HTTPError as e:
-            if e.code == 404:
+            if e.code in (404, 403):
                 return None
             if attempt < MAX_RETRIES - 1:
                 time.sleep(RETRY_BACKOFF ** attempt)
@@ -134,17 +167,45 @@ def api_paginated(url, token, path):
     return all_items
 
 
+def k8s_api(url, token, cluster_id, path):
+    """通过 Rancher proxy 访问下游集群 k8s API"""
+    full_path = "k8s/clusters/{}/{}".format(cluster_id, path.lstrip("/"))
+    return api_get(url, token, full_path)
+
+
+def k8s_list(url, token, cluster_id, path):
+    """k8s API 分页 (使用 continue token)"""
+    items = []
+    cont = None
+    while True:
+        sep = "&" if "?" in path else "?"
+        p = path + "{}limit=200".format(sep)
+        if cont:
+            p += "&continue={}".format(cont)
+        data = k8s_api(url, token, cluster_id, p)
+        if not data:
+            break
+        items.extend(data.get("items", []))
+        cont = data.get("metadata", {}).get("continue", "")
+        if not cont:
+            break
+    return items
+
+
+# ═══════════════════════════════════════════
+#  基础数据获取
+# ═══════════════════════════════════════════
+
 def get_rancher_version(url, token):
     data = api_get(url, token, "v3/settings/server-version")
     return data.get("value", "unknown") if data else "unknown"
 
 
 def get_clusters(url, token):
-    items = api_paginated(url, token, "v3/clusters")
-    return items
+    return api_paginated(url, token, "v3/clusters")
 
 
-def get_nodes(url, token, cluster_id):
+def get_nodes_rancher(url, token, cluster_id):
     return api_paginated(url, token, "v3/nodes?clusterId={}".format(cluster_id))
 
 
@@ -162,157 +223,536 @@ def get_cluster_rbac(url, token, cluster_id):
     return api_paginated(url, token, p)
 
 
-def check_cluster(url, token, cluster):
-    """检查单个集群，返回结果字典"""
-    cid   = cluster["id"]
-    cname = cluster.get("name", cid)
-    state = cluster.get("state", "unknown")
-    is_local = cid == "local"
+# ═══════════════════════════════════════════
+#  检查逻辑
+# ═══════════════════════════════════════════
 
-    result = {
-        "id": cid,
-        "name": cname,
-        "local": is_local,
-        "state": state,
-        "conditions": {},
-        "nodes": [],
-        "projects": [],
-        "rbac": {},
-        "issues": [],
-    }
+def check_control_plane(url, token, cluster_id, cname, deep):
+    """检查控制平面: etcd, scheduler, controller-manager"""
+    result = {"status": OK, "components": {}, "issues": []}
+    if not deep:
+        return result
 
-    # ── 集群条件 ──
-    conditions = cluster.get("conditions", [])
-    bad_conditions = []
-    for c in conditions:
-        ctype = c.get("type", "?")
-        cstatus = c.get("status", "Unknown")
-        result["conditions"][ctype] = cstatus
-        if cstatus not in ("True",):
-            bad_conditions.append("{}={}".format(ctype, cstatus))
+    comps = k8s_api(url, token, cluster_id, "api/v1/componentstatuses")
+    if not comps or not comps.get("items"):
+        # RKE2/K3s 可能 disabled componentstatus，尝试其他方式
+        # 通过检查 kube-system 中 control-plane pods
+        pods = k8s_list(url, token, cluster_id, "api/v1/pods?fieldSelector=spec.nodeName!=")
+        ctrl_pods = defaultdict(lambda: {"ready": 0, "total": 0, "restarts": 0})
+        for p in pods:
+            ns = p["metadata"]["namespace"]
+            name = p["metadata"]["name"]
+            if ns != "kube-system":
+                continue
+            comp = None
+            if name.startswith("etcd-"):
+                comp = "etcd"
+            elif name.startswith("kube-scheduler-"):
+                comp = "scheduler"
+            elif name.startswith("kube-controller-manager-"):
+                comp = "controller-manager"
+            elif name.startswith("cloud-controller-manager-"):
+                comp = "cloud-controller-manager"
+            else:
+                continue
+            csts = p["status"].get("containerStatuses", [])
+            ctrl_pods[comp]["ready"] += sum(1 for c in csts if c.get("ready"))
+            ctrl_pods[comp]["total"] += len(csts)
+            ctrl_pods[comp]["restarts"] += sum(c.get("restartCount", 0) for c in csts)
 
-    # 关键条件检查
-    if "Ready" in result["conditions"]:
-        if result["conditions"]["Ready"] != "True":
-            result["issues"].append({
-                "level": CRITICAL,
-                "item": "Cluster Ready",
-                "detail": "集群 {} 状态: {}".format(cname, result["conditions"]["Ready"]),
-            })
+        for comp, st in ctrl_pods.items():
+            healthy = st["ready"] == st["total"] and st["total"] > 0
+            result["components"][comp] = "Healthy" if healthy else "Unhealthy({}/{})".format(
+                st["ready"], st["total"])
+            if not healthy:
+                result["issues"].append({
+                    "level": WARNING,
+                    "item": "ControlPlane {}".format(comp),
+                    "detail": "{}: {}/{} ready, restarts={}".format(
+                        cname, st["ready"], st["total"], st["restarts"]),
+                })
+            if st["restarts"] > 10:
+                result["issues"].append({
+                    "level": WARNING,
+                    "item": "ControlPlane {} Restarts".format(comp),
+                    "detail": "{}: {} restarts".format(cname, st["restarts"]),
+                })
 
-    if state not in ("active",):
-        result["issues"].append({
-            "level": CRITICAL,
-            "item": "Cluster State",
-            "detail": "集群 {} state={}".format(cname, state),
-        })
+        if not ctrl_pods:
+            result["components"]["control-plane"] = "No pods found"
+    else:
+        for c in comps["items"]:
+            nm = c["metadata"]["name"]
+            for cond in c.get("conditions", []):
+                status = cond.get("status", "Unknown")
+                result["components"][nm] = status
+                if status != "True":
+                    result["issues"].append({
+                        "level": CRITICAL,
+                        "item": "Component {}".format(nm),
+                        "detail": "{}: status={}".format(cname, status),
+                    })
 
-    # 其他异常条件
-    for bc in bad_conditions:
-        result["issues"].append({
-            "level": WARNING,
-            "item": "Cluster Condition",
-            "detail": "{}: {}".format(cname, bc),
-        })
+    # 整体评级
+    has_issue = any(i["level"] in (CRITICAL, WARNING) for i in result["issues"])
+    result["status"] = WARNING if has_issue else OK
 
-    # ── 节点检查 ──
-    nodes = get_nodes(url, token, cid)
-    kubelet_versions = set()
-    kernel_versions  = set()
+    return result
 
-    for n in nodes:
+
+def check_nodes(url, token, cluster_id, cname, deep):
+    """检查节点: Rancher + k8s API"""
+    result = {"nodes": [], "issues": [], "kubelet_versions": set(),
+              "kernel_versions": set(), "container_runtimes": set()}
+
+    # Rancher 节点数据
+    rn = get_nodes_rancher(url, token, cluster_id)
+
+    # k8s 节点数据 (deep)
+    k8s_nodes = []
+    if deep:
+        k8s_data = k8s_api(url, token, cluster_id, "api/v1/nodes")
+        if k8s_data:
+            k8s_nodes = k8s_data.get("items", [])
+
+    # 合并
+    k8s_map = {}
+    for kn in k8s_nodes:
+        k8s_map[kn["metadata"]["name"]] = kn
+
+    for n in rn:
         nid   = n["id"]
-        nhost = n.get("hostname", n.get("nodeName", nid.split(":")[-1]))
-        nstate = n.get("state", "?")
-        info = n.get("info", {})
-        cpu = info.get("cpu", {})
-        mem = info.get("memory", {})
-        os_info = info.get("os", {})
-        k8s = info.get("kubernetes", {})
+        host  = n.get("hostname", n.get("nodeName", nid.split(":")[-1]))
+        state = n.get("state", "?")
+        info  = n.get("info", {})
+        cpu   = info.get("cpu", {})
+        mem   = info.get("memory", {})
+        os_i  = info.get("os", {})
+        k8s_i = info.get("kubernetes", {})
         alloc = n.get("allocatable", {})
         capa  = n.get("capacity", {})
 
-        kubelet_version = k8s.get("kubeletVersion", "?") if isinstance(k8s, dict) else "?"
-        kernel_version  = os_info.get("kernelVersion", "?") if isinstance(os_info, dict) else "?"
-        docker_version  = os_info.get("dockerVersion", "?") if isinstance(os_info, dict) else "?"
+        kubelet_ver = k8s_i.get("kubeletVersion", "?") if isinstance(k8s_i, dict) else "?"
+        kernel_ver  = os_i.get("kernelVersion", "?") if isinstance(os_i, dict) else "?"
+        container_runtime = os_i.get("dockerVersion", "?") if isinstance(os_i, dict) else "?"
 
-        if kubelet_version and kubelet_version != "?":
-            kubelet_versions.add(kubelet_version)
-        if kernel_version and kernel_version != "?":
-            kernel_versions.add(kernel_version)
+        if kubelet_ver and kubelet_ver != "?":
+            result["kubelet_versions"].add(kubelet_ver)
+        if kernel_ver and kernel_ver != "?":
+            result["kernel_versions"].add(kernel_ver)
+        if container_runtime and container_runtime != "?":
+            result["container_runtimes"].add(container_runtime)
 
-        node_info = {
-            "id": nid,
-            "hostname": nhost,
-            "state": nstate,
-            "cpu_cores": cpu.get("count", "?"),
-            "memory_kib": mem.get("memTotalKiB", "?"),
-            "kubelet": kubelet_version,
-            "kernel": kernel_version,
-            "docker": docker_version,
-            "alloc_cpu": alloc.get("cpu", "?"),
-            "alloc_mem": alloc.get("memory", "?"),
-            "alloc_pods": alloc.get("pods", "?"),
-            "capacity_cpu": capa.get("cpu", "?"),
-            "capacity_mem": capa.get("memory", "?"),
-            "capacity_pods": capa.get("pods", "?"),
-            "conditions": {},
-        }
+        node_issues = []
 
+        # ← Rancher conditions
         for cond in n.get("conditions", []):
             ct = cond.get("type", "")
             cs = cond.get("status", "Unknown")
-            node_info["conditions"][ct] = cs
-            if ct not in ("Registered", "Provisioned"):
-                if ct == "Ready" and cs != "True":
-                    result["issues"].append({
-                        "level": CRITICAL,
-                        "item": "Node NotReady",
-                        "detail": "{} ({})".format(nhost, cname),
-                    })
-                elif ct in ("MemoryPressure", "DiskPressure", "PIDPressure") and cs == "True":
-                    result["issues"].append({
-                        "level": WARNING,
-                        "item": "Node {}".format(ct),
-                        "detail": "{} ({})".format(nhost, cname),
-                    })
+            if ct == "Ready" and cs != "True":
+                node_issues.append({
+                    "level": CRITICAL,
+                    "item": "Node NotReady",
+                    "detail": "{} ({})".format(host, cname),
+                })
+            elif ct in ("MemoryPressure", "DiskPressure", "PIDPressure") and cs == "True":
+                node_issues.append({
+                    "level": WARNING,
+                    "item": "Node {}".format(ct),
+                    "detail": "{} ({})".format(host, cname),
+                })
 
-        if nstate not in ("active",):
-            result["issues"].append({
+        if state not in ("active",):
+            node_issues.append({
                 "level": WARNING,
                 "item": "Node State",
-                "detail": "{} state={} ({})".format(nhost, nstate, cname),
+                "detail": "{} state={} ({})".format(host, state, cname),
             })
 
+        # ← k8s node conditions
+        kn = k8s_map.get(host, k8s_map.get(nid.split(":")[-1], {}))
+        k8s_conds = []
+        if kn:
+            for cond in kn.get("status", {}).get("conditions", []):
+                ct = cond["type"]
+                cs = cond["status"]
+                k8s_conds.append("{}={}".format(ct, cs))
+                if ct == "Ready" and cs != "True":
+                    node_issues.append({
+                        "level": CRITICAL,
+                        "item": "Node K8s NotReady",
+                        "detail": "{} reason={} ({})".format(
+                            host, cond.get("reason", "?"), cname),
+                    })
+                elif ct in ("MemoryPressure", "DiskPressure", "PIDPressure") and cs == "True":
+                    node_issues.append({
+                        "level": WARNING,
+                        "item": "Node K8s {}".format(ct),
+                        "detail": "{} ({})".format(host, cname),
+                    })
+                elif ct == "NetworkUnavailable" and cs == "True":
+                    node_issues.append({
+                        "level": CRITICAL,
+                        "item": "Node NetworkUnavailable",
+                        "detail": "{} CNI 可能异常 ({})".format(host, cname),
+                    })
+
+        node_info = {
+            "hostname": host,
+            "state": state,
+            "cpu_cores": cpu.get("count", "?"),
+            "memory_kib": str(mem.get("memTotalKiB", "?")),
+            "kubelet": kubelet_ver,
+            "kernel": kernel_ver,
+            "runtime": container_runtime,
+            "alloc_cpu": alloc.get("cpu", "?"),
+            "alloc_mem": alloc.get("memory", "?"),
+            "alloc_pods": alloc.get("pods", "?"),
+            "capacity_pods": capa.get("pods", "?"),
+            "ready": "Ready" in [c.get("type") for c in n.get("conditions", [])
+                                 if c.get("status") == "True" and c.get("type") == "Ready"],
+            "k8s_conditions": k8s_conds,
+        }
+
         result["nodes"].append(node_info)
+        result["issues"].extend(node_issues)
 
     # 版本一致性
-    if len(kubelet_versions) > 1:
+    if len(result["kubelet_versions"]) > 1:
         result["issues"].append({
             "level": WARNING,
             "item": "Kubelet Version Mismatch",
-            "detail": "{}: {}".format(cname, ", ".join(sorted(kubelet_versions))),
+            "detail": "{}: {}".format(cname, ", ".join(sorted(result["kubelet_versions"]))),
         })
 
-    # ── 项目检查 ──
-    projects = get_projects(url, token, cid)
+    return result
+
+
+def check_cni(url, token, cluster_id, cname, deep):
+    """检查 CNI: DaemonSet 状态、所有节点覆盖"""
+    result = {"cni_type": "unknown", "status": OK, "daemonsets": [], "issues": []}
+    if not deep:
+        return result
+
+    pods = k8s_list(url, token, cluster_id, "api/v1/pods")
+    ds_data = k8s_api(url, token, cluster_id, "apis/apps/v1/daemonsets")
+    ds_list = ds_data.get("items", []) if ds_data else []
+
+    # 通过 DaemonSet 识别 CNI
+    cni_ds = []
+    for ds in ds_list:
+        name = ds["metadata"]["name"].lower()
+        ns   = ds["metadata"]["namespace"]
+        for pattern, label in CNI_PATTERNS:
+            if pattern in name:
+                ready = ds["status"].get("numberReady", 0) or 0
+                desired = ds["status"].get("desiredNumberScheduled", 0) or 0
+                cni_ds.append({
+                    "name": name, "namespace": ns, "label": label,
+                    "ready": ready, "desired": desired,
+                    "healthy": ready == desired and desired > 0,
+                })
+                if not cni_ds[-1]["healthy"]:
+                    result["issues"].append({
+                        "level": WARNING,
+                        "item": "CNI NotReady",
+                        "detail": "{}/{}/{}: {}/{} ready ({})".format(
+                            cname, ns, name, ready, desired, label),
+                    })
+                break
+
+    if cni_ds:
+        result["cni_type"] = ", ".join(d["label"] for d in cni_ds)
+    else:
+        # 兜底：从 pod 和 kubeconfig 推测
+        for p in pods:
+            for pattern, label in CNI_PATTERNS:
+                if pattern in p["metadata"]["name"].lower():
+                    result["cni_type"] = label
+                    break
+            if result["cni_type"] != "unknown":
+                break
+
+    if result["cni_type"] == "unknown":
+        result["issues"].append({
+            "level": INFO,
+            "item": "CNI Unknown",
+            "detail": "{}: 未检测到已知 CNI 类型".format(cname),
+        })
+
+    result["daemonsets"] = cni_ds
+    return result
+
+
+def check_csi(url, token, cluster_id, cname, deep):
+    """检查 CSI: StorageClass、CSI DaemonSet、PVC 状态"""
+    result = {"drivers": [], "storage_classes": [], "pvc_total": 0,
+              "pvc_pending": 0, "status": OK, "issues": []}
+    if not deep:
+        return result
+
+    # StorageClass
+    sc_data = k8s_api(url, token, cluster_id, "apis/storage.k8s.io/v1/storageclasses")
+    if sc_data:
+        for sc in sc_data.get("items", []):
+            sc_name = sc["metadata"]["name"]
+            provisioner = sc.get("provisioner", "?")
+            is_default = sc["metadata"].get("annotations", {}).get(
+                "storageclass.kubernetes.io/is-default-class", "false")
+            result["storage_classes"].append({
+                "name": sc_name, "provisioner": provisioner,
+                "default": is_default == "true",
+            })
+
+    # CSI DaemonSet / Deployment
+    ds_data = k8s_api(url, token, cluster_id, "apis/apps/v1/daemonsets")
+    ds_list = ds_data.get("items", []) if ds_data else []
+    deploys = k8s_api(url, token, cluster_id, "apis/apps/v1/deployments")
+    deploy_list = deploys.get("items", []) if deploys else []
+
+    for obj in ds_list + deploy_list:
+        name = obj["metadata"]["name"].lower()
+        ns   = obj["metadata"]["namespace"]
+        if ns not in CSI_NS:
+            continue
+        for pattern, label in CSI_PATTERNS:
+            if pattern in name:
+                ready = obj["status"].get("numberReady", 0) or 0
+                if ready == 0:
+                    ready = obj["status"].get("readyReplicas", 0) or 0
+                desired = obj["status"].get("desiredNumberScheduled", 0) or 0
+                if desired == 0:
+                    desired = obj["status"].get("replicas", 0) or 0
+                kind = "DaemonSet" if "DaemonSet" in str(type(obj)) else "Deployment"
+                result["drivers"].append({
+                    "name": name, "namespace": ns, "label": label,
+                    "kind": kind, "ready": ready, "desired": desired,
+                    "healthy": ready == desired and desired > 0,
+                })
+                if not result["drivers"][-1]["healthy"] and ready > 0:
+                    result["issues"].append({
+                        "level": WARNING,
+                        "item": "CSI NotReady",
+                        "detail": "{}/{}/{}: {}/{} ready ({})".format(
+                            cname, ns, name, ready, desired, label),
+                    })
+
+    # PVC 状态
+    pvcs = k8s_list(url, token, cluster_id, "api/v1/persistentvolumeclaims")
+    result["pvc_total"] = len(pvcs)
+    for pvc in pvcs:
+        phase = pvc["status"].get("phase", "Unknown")
+        if phase != "Bound":
+            result["pvc_pending"] += 1
+            result["issues"].append({
+                "level": WARNING,
+                "item": "PVC Not Bound",
+                "detail": "{}/{}/{}: phase={}".format(
+                    cname, pvc["metadata"]["namespace"],
+                    pvc["metadata"]["name"], phase),
+            })
+
+    return result
+
+
+def check_system_components(url, token, cluster_id, cname, deep):
+    """检查系统组件: CoreDNS, Ingress, Metrics-server, 高重启 Pod"""
+    result = {"components": [], "high_restarts": [], "issues": [],
+              "failed_pods": [], "status": OK}
+    if not deep:
+        return result
+
+    KEY_COMPONENTS = {
+        "coredns":       "CoreDNS",
+        "rke2-coredns":  "CoreDNS",
+        "kube-dns":      "CoreDNS",
+        "ingress-nginx": "Ingress NGINX",
+        "metrics-server": "Metrics Server",
+        "rke2-ingress-nginx": "Ingress NGINX",
+        "rke2-metrics-server": "Metrics Server",
+    }
+
+    pods = k8s_list(url, token, cluster_id, "api/v1/pods")
+    ds_data = k8s_api(url, token, cluster_id, "apis/apps/v1/daemonsets")
+    ds_list = ds_data.get("items", []) if ds_data else []
+    deploys = k8s_api(url, token, cluster_id, "apis/apps/v1/deployments")
+    deploy_list = deploys.get("items", []) if deploys else []
+
+    # 检查关键组件 DaemonSet/Deployment
+    for obj in ds_list + deploy_list:
+        name = obj["metadata"]["name"]
+        ns   = obj["metadata"]["namespace"]
+        if ns != "kube-system":
+            continue
+        for key, label in KEY_COMPONENTS.items():
+            if (key in name.lower() or name.lower().startswith(key.lower())):
+                # 跳过 autoscaler 类 deployment
+                if "autoscaler" in name.lower():
+                    continue
+                ready = obj["status"].get("numberReady", 0) or 0
+                if ready == 0:
+                    ready = obj["status"].get("readyReplicas", 0) or 0
+                desired = obj["status"].get("desiredNumberScheduled", 0) or 0
+                if desired == 0:
+                    desired = obj["status"].get("replicas", 0) or 0
+                result["components"].append({
+                    "name": name, "label": label, "ready": ready, "desired": desired,
+                    "healthy": ready == desired and desired > 0,
+                })
+                if not result["components"][-1]["healthy"]:
+                    result["issues"].append({
+                        "level": WARNING,
+                        "item": "{} NotReady".format(label),
+                        "detail": "{}: {}/{} ready".format(cname, ready, desired),
+                    })
+                break
+
+    # 高重启 + 异常 pod
+    for p in pods:
+        ns   = p["metadata"]["namespace"]
+        name = p["metadata"]["name"]
+        phase = p["status"].get("phase", "?")
+        csts = p["status"].get("containerStatuses", [])
+        ready = sum(1 for c in csts if c.get("ready"))
+        total = len(csts)
+        restarts = sum(c.get("restartCount", 0) for c in csts)
+
+        # helm-install jobs (Completed 的正常)
+        if "helm-install" in name and phase in ("Succeeded",):
+            continue
+
+        if restarts > 20:
+            result["high_restarts"].append({
+                "namespace": ns, "name": name, "restarts": restarts, "phase": phase,
+            })
+            result["issues"].append({
+                "level": WARNING,
+                "item": "High Restarts",
+                "detail": "{}/{}/{}: {} restarts".format(cname, ns, name, restarts),
+            })
+
+        if phase in ("Failed", "Unknown"):
+            if "helm-install" in name:
+                continue  # helm-install failed 也可能正常
+            result["failed_pods"].append({
+                "namespace": ns, "name": name, "phase": phase,
+            })
+            result["issues"].append({
+                "level": WARNING,
+                "item": "Pod Failed",
+                "detail": "{}/{}/{}: phase={}".format(cname, ns, name, phase),
+            })
+
+    return result
+
+
+def check_workloads(url, token, cluster_id, cname, deep):
+    """检查工作负载: Deployment/DaemonSet 副本状态"""
+    result = {"mismatched": [], "issues": [], "status": OK}
+    if not deep:
+        return result
+
+    for kind, api_path in [("Deployment", "apis/apps/v1/deployments"),
+                            ("DaemonSet", "apis/apps/v1/daemonsets"),
+                            ("StatefulSet", "apis/apps/v1/statefulsets")]:
+        data = k8s_api(url, token, cluster_id, api_path)
+        if not data:
+            continue
+        for obj in data.get("items", []):
+            name = obj["metadata"]["name"]
+            ns   = obj["metadata"]["namespace"]
+            if ns in ("kube-system", "cattle-system", "longhorn-system",
+                      "calico-system", "kube-public"):
+                continue  # 系统组件在 check_system_components 中处理
+
+            if kind == "DaemonSet":
+                ready = obj["status"].get("numberReady", 0) or 0
+                desired = obj["status"].get("desiredNumberScheduled", 0) or 0
+            else:
+                ready = obj["status"].get("readyReplicas", 0) or 0
+                desired = obj.get("spec", {}).get("replicas", 0) or 0
+
+            if ready != desired and desired > 0:
+                result["mismatched"].append({
+                    "namespace": ns, "name": name, "kind": kind,
+                    "ready": ready, "desired": desired,
+                })
+
+    if result["mismatched"]:
+        result["status"] = WARNING
+        for m in result["mismatched"][:10]:
+            result["issues"].append({
+                "level": WARNING,
+                "item": "{} Replicas".format(m["kind"]),
+                "detail": "{}/{}/{}: {}/{} replicas ({})".format(
+                    cname, m["namespace"], m["name"],
+                    m["ready"], m["desired"], cname),
+            })
+
+    return result
+
+
+def check_events(url, token, cluster_id, cname, deep):
+    """检查最近 Warning 事件"""
+    result = {"warnings": [], "issues": [], "status": OK}
+    if not deep:
+        return result
+
+    data = k8s_api(url, token, cluster_id, "api/v1/events?limit=100")
+    if not data:
+        return result
+
+    for e in data.get("items", []):
+        if e.get("type") == "Warning":
+            result["warnings"].append({
+                "namespace": e["metadata"]["namespace"],
+                "name": e["metadata"]["name"],
+                "reason": e.get("reason", "?"),
+                "message": (e.get("message", "") or "")[:120],
+                "time": e.get("lastTimestamp", e.get("eventTime", e["metadata"].get("creationTimestamp", ""))),
+            })
+
+    if result["warnings"]:
+        result["status"] = INFO
+        # 只取最近10条不同reason的
+        seen = set()
+        uniq = []
+        for w in result["warnings"]:
+            key = w["reason"]
+            if key not in seen:
+                seen.add(key)
+                uniq.append(w)
+                if len(uniq) >= 10:
+                    break
+        result["warnings"] = uniq
+        for w in uniq:
+            result["issues"].append({
+                "level": INFO,
+                "item": "Event: {}".format(w["reason"]),
+                "detail": "{} ({}/{})".format(w["message"][:80], cname, w["namespace"]),
+            })
+
+    return result
+
+
+def check_projects_and_rbac(url, token, cluster_id, cname):
+    """检查项目和 RBAC"""
+    result = {"projects": [], "rbac_cluster": {}, "issues": [], "status": OK}
+
+    projects = get_projects(url, token, cluster_id)
     result["project_count"] = len(projects)
 
     for proj in projects:
         pid   = proj["id"]
         pname = proj.get("name", pid)
         pstate = proj.get("state", "?")
-
-        # 检查项目是否存在成员
         bindings = get_project_rbac(url, token, pid)
         member_count = len([b for b in bindings
                           if b.get("userId") or b.get("userPrincipalId")
                           or b.get("groupPrincipalId")])
 
         proj_info = {
-            "id": pid,
-            "name": pname,
-            "state": pstate,
+            "name": pname, "state": pstate,
             "member_count": member_count,
             "system": pname in ("System", "Default"),
         }
@@ -332,16 +772,15 @@ def check_cluster(url, token, cluster):
                 "detail": "{}/{} 无成员绑定".format(cname, pname),
             })
 
-    # ── 集群级 RBAC ──
-    crtb = get_cluster_rbac(url, token, cid)
+    # 集群级 RBAC
+    crtb = get_cluster_rbac(url, token, cluster_id)
     cluster_roles = Counter()
     for b in crtb:
         rt = b.get("roleTemplateId", "")
         if rt:
             cluster_roles[rt] += 1
-    result["rbac"]["cluster"] = dict(cluster_roles)
+    result["rbac_cluster"] = dict(cluster_roles)
 
-    # 集群无成员检查
     if not crtb:
         result["issues"].append({
             "level": INFO,
@@ -352,8 +791,136 @@ def check_cluster(url, token, cluster):
     return result
 
 
-def generate_report(results, version, url):
-    """生成巡检报告"""
+def check_cluster(url, token, cluster, deep):
+    """检查单个集群"""
+    cid   = cluster["id"]
+    cname = cluster.get("name", cid)
+    state = cluster.get("state", "unknown")
+    is_local = cid == "local"
+    provider = cluster.get("provider", cluster.get("driver", "?"))
+    ver = cluster.get("version", {})
+    k8s_ver = ver.get("gitVersion", cluster.get("rke2Config", {}).get("kubernetesVersion", "?"))
+
+    result = {
+        "id": cid, "name": cname, "local": is_local,
+        "state": state, "provider": provider, "k8s_version": k8s_ver,
+        "conditions": {},
+    }
+
+    # 集群条件
+    for c in cluster.get("conditions", []):
+        result["conditions"][c.get("type", "?")] = c.get("status", "Unknown")
+
+    # 汇总 issues
+    all_issues = []
+
+    # State
+    if state not in ("active",):
+        all_issues.append({
+            "level": CRITICAL,
+            "item": "Cluster State",
+            "detail": "集群 {} state={}".format(cname, state),
+        })
+    if result["conditions"].get("Ready") != "True":
+        all_issues.append({
+            "level": CRITICAL,
+            "item": "Cluster NotReady",
+            "detail": "集群 {} Ready={}".format(cname, result["conditions"].get("Ready", "?")),
+        })
+
+    # 控制平面
+    cp = check_control_plane(url, token, cid, cname, deep)
+    result["control_plane"] = cp
+    all_issues.extend(cp["issues"])
+
+    # 节点
+    nd = check_nodes(url, token, cid, cname, deep)
+    result["nodes"] = nd["nodes"]
+    result["node_issues"] = nd["issues"]
+    result["kubelet_versions"] = list(nd["kubelet_versions"])
+    result["kernel_versions"] = list(nd["kernel_versions"])
+    result["container_runtimes"] = list(nd["container_runtimes"])
+    all_issues.extend(nd["issues"])
+
+    # CNI
+    cni = check_cni(url, token, cid, cname, deep)
+    result["cni"] = cni
+    all_issues.extend(cni["issues"])
+
+    # CSI
+    csi = check_csi(url, token, cid, cname, deep)
+    result["csi"] = csi
+    all_issues.extend(csi["issues"])
+
+    # 系统组件
+    sysc = check_system_components(url, token, cid, cname, deep)
+    result["system_components"] = sysc
+    all_issues.extend(sysc["issues"])
+
+    # 工作负载
+    wl = check_workloads(url, token, cid, cname, deep)
+    result["workloads"] = wl
+    all_issues.extend(wl["issues"])
+
+    # 事件
+    ev = check_events(url, token, cid, cname, deep)
+    result["events"] = ev
+    all_issues.extend(ev["issues"])
+
+    # 项目 + RBAC
+    pr = check_projects_and_rbac(url, token, cid, cname)
+    result["projects"] = pr["projects"]
+    result["project_count"] = pr["project_count"]
+    result["rbac"] = pr
+    all_issues.extend(pr["issues"])
+
+    result["issues"] = all_issues
+    result["deep_check"] = deep
+
+    # 整体评级
+    has_critical = any(i["level"] == CRITICAL for i in all_issues)
+    has_warning  = any(i["level"] == WARNING for i in all_issues)
+    result["health"] = CRITICAL if has_critical else WARNING if has_warning else OK
+
+    return result
+
+
+# ═══════════════════════════════════════════
+#  报告生成
+# ═══════════════════════════════════════════
+
+def _hdr(lines, title, level=2):
+    lines.append("{} {}".format("#" * level, title))
+    lines.append("")
+
+
+def _table(lines, headers, rows):
+    lines.append("| " + " | ".join(headers) + " |")
+    lines.append("|" + "|".join(["------"] * len(headers)) + "|")
+    for row in rows:
+        lines.append("| " + " | ".join(str(c) for c in row) + " |")
+    lines.append("")
+
+
+def _icon(level):
+    return LEVEL_ICON.get(level, "⬜")
+
+
+def _mem_fmt(kib_str):
+    """格式化内存: 3843688Ki → 3.7 GiB"""
+    try:
+        val = int(re.sub(r"[^0-9]", "", str(kib_str)))
+        if val == 0:
+            return kib_str
+        if val > 1024 * 1024:
+            return "{:.1f} GiB".format(val / 1024.0 / 1024.0)
+        return "{:.1f} MiB".format(val / 1024.0)
+    except:
+        return str(kib_str)
+
+
+def generate_report(results, version, url, deep):
+    """生成 Markdown 巡检报告"""
     lines = []
     total_issues = sum(len(r["issues"]) for r in results)
     critical = sum(1 for r in results for i in r["issues"] if i["level"] == CRITICAL)
@@ -361,144 +928,214 @@ def generate_report(results, version, url):
     infos    = sum(1 for r in results for i in r["issues"] if i["level"] == INFO)
 
     total_nodes     = sum(len(r["nodes"]) for r in results)
-    total_projects  = sum(len(r["projects"]) for r in results)
+    total_projects  = sum(r.get("project_count", 0) for r in results)
     total_clusters  = len(results)
 
-    lines.append("## Rancher 集群巡检报告")
-    lines.append("")
-    lines.append("| 项目 | 值 |")
-    lines.append("|------|----|")
-    lines.append("| Rancher URL | {} |".format(url))
-    lines.append("| Rancher 版本 | {} |".format(version))
-    lines.append("| 巡检时间 | {} |".format(time.strftime("%Y-%m-%d %H:%M:%S")))
-    lines.append("| 集群总数 | {} |".format(total_clusters))
-    lines.append("| 节点总数 | {} |".format(total_nodes))
-    lines.append("| 项目总数 | {} |".format(total_projects))
-    lines.append("")
+    _hdr(lines, "Rancher 集群巡检报告", 2)
+    _table(lines, ["项目", "值"], [
+        ["Rancher URL", url],
+        ["Rancher 版本", version],
+        ["巡检时间", time.strftime("%Y-%m-%d %H:%M:%S")],
+        ["深度检查 (k8s API)", "是" if deep else "否"],
+        ["集群总数", total_clusters],
+        ["节点总数", total_nodes],
+        ["项目总数", total_projects],
+    ])
 
     # ── 风险摘要 ──
-    lines.append("### ⚠️ 风险摘要")
-    lines.append("")
+    _hdr(lines, "⚠️ 风险摘要", 3)
     if total_issues == 0:
-        lines.append("> 未发现风险项，所有集群运行正常 🎉")
+        lines.append("> ✅ 未发现风险项，所有集群运行正常")
+        lines.append("")
     else:
         lines.append("| 等级 | 数量 |")
         lines.append("|------|------|")
         if critical:
-            lines.append("| {} | {} |".format(CRITICAL, critical))
+            lines.append("| {} {} | {} |".format(_icon(CRITICAL), CRITICAL, critical))
         if warnings:
-            lines.append("| {} | {} |".format(WARNING, warnings))
+            lines.append("| {} {} | {} |".format(_icon(WARNING), WARNING, warnings))
         if infos:
-            lines.append("| {} | {} |".format(INFO, infos))
+            lines.append("| {} {} | {} |".format(_icon(INFO), INFO, infos))
         lines.append("")
-
-        lines.append("#### 详细风险项")
-        lines.append("")
-        for r in results:
-            if r["issues"]:
-                lines.append("**集群: {}** (`{}`)".format(r["name"], r["id"]))
-                lines.append("")
-                for issue in r["issues"]:
-                    lines.append("- {} **{}**: {}".format(issue["level"], issue["item"], issue["detail"]))
-                lines.append("")
 
     # ── 集群概览 ──
-    lines.append("### 🖥️ 集群概览")
-    lines.append("")
-    lines.append("| 集群 | 类型 | 状态 | 节点数 | 项目数 | 条件 |")
-    lines.append("|------|------|------|--------|--------|------|")
-    for r in results:
-        ctype  = "local" if r["local"] else "downstream"
-        state  = r["state"]
-        ncount = len(r["nodes"])
-        pcount = len(r["projects"])
-        cond_ok = sum(1 for v in r["conditions"].values() if v == "True")
-        cond_total = len(r["conditions"])
-        cond_str = "{} OK".format(cond_total) if cond_ok == cond_total else "{}/{} OK".format(cond_ok, cond_total)
-        state_icon = "✅" if state == "active" else "⚠️"
-        lines.append("| {} {} | {} | {} | {} | {} | {} |".format(
-            state_icon, r["name"], ctype, state, ncount, pcount, cond_str))
-    lines.append("")
+    _hdr(lines, "🖥️ 集群概览", 3)
+    _table(lines, ["集群", "类型", "Provider", "K8s", "状态", "节点", "项目", "健康"],
+           [["{} {}".format(_icon(r["health"]), r["name"]),
+             "local" if r["local"] else "downstream",
+             r["provider"],
+             r["k8s_version"][:25],
+             r["state"],
+             len(r["nodes"]),
+             r.get("project_count", 0),
+             "{} {}".format(_icon(r["health"]), r["health"])]
+            for r in results])
 
-    # ── 节点详情 ──
-    lines.append("### 🖧 节点详情")
-    lines.append("")
+    # ── 逐集群详情 ──
     for r in results:
+        if r["issues"]:
+            _hdr(lines, "{} {} — 风险详情".format(_icon(r["health"]), r["name"]), 3)
+            for issue in r["issues"]:
+                lines.append("- {} **{}**: {}".format(
+                    _icon(issue["level"]), issue["item"], issue["detail"]))
+            lines.append("")
+
+    for r in results:
+        _hdr(lines, "🖧 {} — 节点详情".format(r["name"]), 3)
         if r["nodes"]:
-            lines.append("#### {}".format(r["name"]))
-            lines.append("")
-            lines.append("| 节点 | 状态 | CPU | 内存 | Pods | Kubelet | 内核 |")
-            lines.append("|------|------|-----|------|------|---------|------|")
+            rows = []
             for n in r["nodes"]:
-                ready = "✅" if n["conditions"].get("Ready") == "True" else "⚠️"
-                lines.append("| {} {} | {} | {}核 | {} | {}/{} | {} | {} |".format(
-                    ready, n["hostname"],
+                ready_icon = "✅" if n["ready"] else "🔴"
+                rows.append([
+                    "{} {}".format(ready_icon, n["hostname"]),
                     n["state"],
-                    n["cpu_cores"],
-                    n["alloc_mem"],
-                    n["alloc_pods"], n["capacity_pods"],
-                    n["kubelet"],
-                    n["kernel"],
-                ))
+                    "{}核".format(n["cpu_cores"]),
+                    _mem_fmt(n["memory_kib"]),
+                    "{}/{}".format(n["alloc_pods"], n["capacity_pods"]),
+                    n["kubelet"][:25],
+                    n["runtime"][:25] if n["runtime"] else "?",
+                ])
+            _table(lines, ["节点", "状态", "CPU", "内存", "Pods", "Kubelet", "Runtime"], rows)
+        else:
+            lines.append("_(无节点数据)_\n")
+
+        # 版本一致性
+        if len(r.get("kubelet_versions", [])) > 1:
+            lines.append("⚠️ **Kubelet 版本不一致**: {}".format(
+                ", ".join(r["kubelet_versions"])))
+            lines.append("")
+        if len(r.get("container_runtimes", [])) > 1:
+            lines.append("⚠️ **容器运行时不一致**: {}".format(
+                ", ".join(r["container_runtimes"])))
             lines.append("")
 
-    # ── 项目检查 ──
-    lines.append("### 📦 项目检查")
-    lines.append("")
-    for r in results:
-        non_system = [p for p in r["projects"] if not p["system"]]
-        empty = [p for p in non_system if p["member_count"] == 0]
+        # ── 控制平面 ──
+        cp = r.get("control_plane", {})
+        if cp.get("components"):
+            _hdr(lines, "⚙️ {} — 控制平面".format(r["name"]), 3)
+            _table(lines, ["组件", "状态"],
+                   [[comp, "✅" if st == "True" or "Healthy" in st else "⚠️ " + st]
+                    for comp, st in cp["components"].items()])
+
+        # ── CNI ──
+        cni = r.get("cni", {})
+        if cni.get("cni_type"):
+            _hdr(lines, "🌐 {} — CNI: {}".format(r["name"], cni["cni_type"]), 3)
+            if cni.get("daemonsets"):
+                _table(lines, ["DaemonSet", "Ready", "Desired", "状态"],
+                       [["{}/{}".format(d["namespace"], d["name"]),
+                         d["ready"], d["desired"],
+                         "✅" if d["healthy"] else "⚠️"]
+                        for d in cni["daemonsets"]])
+
+        # ── CSI ──
+        csi = r.get("csi", {})
+        has_csi_info = csi.get("drivers") or csi.get("storage_classes") or csi.get("pvc_total", 0) > 0
+        if deep and has_csi_info:
+            _hdr(lines, "💾 {} — 存储 (CSI)".format(r["name"]), 3)
+            if csi.get("storage_classes"):
+                _table(lines, ["StorageClass", "Provisioner", "默认"],
+                       [["⭐ " + sc["name"] if sc["default"] else sc["name"],
+                         sc["provisioner"],
+                         "是" if sc["default"] else ""]
+                        for sc in csi["storage_classes"]])
+            if csi.get("drivers"):
+                _table(lines, ["CSI Driver", "Kind", "Ready", "Desired", "状态"],
+                       [["{}/{}".format(d["namespace"], d["name"]),
+                         d["kind"], d["ready"], d["desired"],
+                         "✅" if d["healthy"] else "⚠️"]
+                        for d in csi["drivers"]])
+            if csi.get("pvc_pending", 0) > 0:
+                lines.append("⚠️ {} 个 PVC 未 Bound (共 {} 个)".format(
+                    csi["pvc_pending"], csi["pvc_total"]))
+                lines.append("")
+            elif csi.get("pvc_total", 0) > 0:
+                lines.append("✅ 所有 {} 个 PVC 已 Bound".format(csi["pvc_total"]))
+                lines.append("")
+
+        # ── 系统组件 ──
+        sysc = r.get("system_components", {})
+        if sysc.get("components"):
+            _hdr(lines, "🔧 {} — 系统组件".format(r["name"]), 3)
+            _table(lines, ["组件", "Ready", "Desired", "状态"],
+                   [["{}".format(c["label"]),
+                     c["ready"], c["desired"],
+                     "✅" if c["healthy"] else "⚠️"]
+                    for c in sysc["components"]])
+
+        if sysc.get("high_restarts"):
+            _hdr(lines, "🔄 高重启 Pod (>20次)", 4)
+            _table(lines, ["Namespace", "Name", "Restarts", "Phase"],
+                   [[h["namespace"], h["name"], h["restarts"], h["phase"]]
+                    for h in sysc["high_restarts"][:10]])
+
+        # ── 工作负载 ──
+        wl = r.get("workloads", {})
+        if wl.get("mismatched"):
+            _hdr(lines, "📦 {} — 副本异常".format(r["name"]), 3)
+            _table(lines, ["Kind", "Namespace/Name", "Ready/Desired"],
+                   [["{}".format(m["kind"]),
+                     "{}/{}".format(m["namespace"], m["name"]),
+                     "{}/{}".format(m["ready"], m["desired"])]
+                    for m in wl["mismatched"][:20]])
+
+        # ── 事件 ──
+        ev = r.get("events", {})
+        if ev.get("warnings"):
+            _hdr(lines, "📋 {} — 最近 Warning 事件".format(r["name"]), 3)
+            for w in ev["warnings"][:10]:
+                lines.append("- **[{}]** {}/{}: {}".format(
+                    w["reason"], w["namespace"], w["name"],
+                    (w["message"] or "")[:100]))
+            lines.append("")
+
+        # ── 项目 ──
+        non_system = [p for p in r.get("projects", []) if not p["system"]]
         if non_system:
-            lines.append("#### {} ({} 个非系统项目)".format(r["name"], len(non_system)))
-            lines.append("")
-            lines.append("| 项目 | 状态 | 成员数 |")
-            lines.append("|------|------|--------|")
-            for p in non_system:
-                state_icon = "✅" if p["state"] == "active" else "⚠️"
-                member_icon = "👤" if p["member_count"] > 0 else "❌"
-                lines.append("| {} | {} {} | {} {} |".format(
-                    p["name"], state_icon, p["state"], member_icon, p["member_count"]))
-            lines.append("")
+            _hdr(lines, "📦 {} — 项目 ({} 个)".format(r["name"], len(non_system)), 3)
+            _table(lines, ["项目", "状态", "成员数"],
+                   [["{}".format(p["name"]),
+                     "✅" if p["state"] == "active" else "⚠️ " + p["state"],
+                     "{}".format(p["member_count"])]
+                    for p in non_system])
 
-    # ── RBAC 概览 ──
-    lines.append("### 🔐 RBAC 概览")
-    lines.append("")
-    for r in results:
-        cr = r["rbac"].get("cluster", {})
-        if cr:
-            lines.append("#### {} — 集群级角色".format(r["name"]))
-            lines.append("")
-            lines.append("| 角色 | 绑定数 |")
-            lines.append("|------|--------|")
-            for role, count in sorted(cr.items()):
-                lines.append("| {} | {} |".format(role, count))
-            lines.append("")
+        # ── RBAC ──
+        rb = r.get("rbac", {})
+        if rb.get("rbac_cluster"):
+            _hdr(lines, "🔐 {} — 集群级角色".format(r["name"]), 3)
+            _table(lines, ["角色", "绑定数"],
+                   [[role, count] for role, count in sorted(rb["rbac_cluster"].items())])
 
     return "\n".join(lines)
 
 
-def generate_json(results, version, url):
+def generate_json(results, version, url, deep):
     return json.dumps({
         "rancher_url": url,
         "rancher_version": version,
         "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S"),
+        "deep_check": deep,
         "clusters": results,
-    }, indent=2, ensure_ascii=False)
+    }, indent=2, ensure_ascii=False, default=str)
 
 
 def main():
     import argparse
-    parser = argparse.ArgumentParser(description="Rancher 集群巡检")
+    parser = argparse.ArgumentParser(description="Rancher 集群巡检 (完整版)")
     parser.add_argument("-o", "--output", help="输出文件 (.md / .json)")
     parser.add_argument("-e", "--env", help="env 文件路径")
-    parser.add_argument("-c", "--cluster", action="append", help="限定集群 (支持 name 或 id)")
-    parser.add_argument("--json", action="store_true", help="JSON 格式输出")
+    parser.add_argument("-c", "--cluster", action="append", help="限定集群")
+    parser.add_argument("--json", action="store_true", help="JSON 格式")
+    parser.add_argument("--no-deep", action="store_true",
+                        help="跳过 k8s API 深度检查 (仅 Rancher 级别)")
     args = parser.parse_args()
 
     url, token = load_env(args.env)
     version = get_rancher_version(url, token)
+    deep = not args.no_deep
 
     print("# Rancher: {} ({})".format(url, version), file=sys.stderr)
+    print("# 深度检查: {}".format("是" if deep else "否"), file=sys.stderr)
     print("# 正在巡检...", file=sys.stderr)
 
     clusters = get_clusters(url, token)
@@ -512,12 +1149,12 @@ def main():
             if cid not in cf and cname not in cf:
                 continue
         print("  # 检查: {} ({})".format(cname, cid), file=sys.stderr)
-        r = check_cluster(url, token, cl)
+        r = check_cluster(url, token, cl, deep)
         results.append(r)
 
     # 输出
     if args.json or (args.output and args.output.endswith(".json")):
-        out = generate_json(results, version, url)
+        out = generate_json(results, version, url, deep)
         if args.output:
             with open(args.output, "w") as f:
                 f.write(out)
@@ -525,7 +1162,7 @@ def main():
         else:
             print(out)
     else:
-        out = generate_report(results, version, url)
+        out = generate_report(results, version, url, deep)
         if args.output:
             with open(args.output, "w") as f:
                 f.write(out)
@@ -533,7 +1170,6 @@ def main():
         else:
             print(out)
 
-    # 退出码
     critical_count = sum(1 for r in results for i in r["issues"] if i["level"] == CRITICAL)
     if critical_count:
         sys.exit(1)
