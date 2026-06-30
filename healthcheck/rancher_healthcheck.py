@@ -480,6 +480,121 @@ def check_nodes(url, token, cluster_id, cname, deep, k8s_version=""):
     return result
 
 
+def check_non_running_pods(url, token, cluster_id, cname, deep):
+    """检查非 Running 状态的 Pod（全命名空间）"""
+    result = {"pods": [], "issues": [], "status": OK}
+    if not deep:
+        return result
+
+    pods = k8s_list(url, token, cluster_id, "api/v1/pods")
+    for p in pods:
+        ns   = p["metadata"]["namespace"]
+        name = p["metadata"]["name"]
+        phase = p["status"].get("phase", "?")
+
+        if phase in ("Running", "Succeeded"):
+            continue
+
+        # 收集容器等待原因
+        csts = p["status"].get("containerStatuses", [])
+        wait_reasons = []
+        crash_count = 0
+        for c in csts:
+            wait = c.get("state", {}).get("waiting", {})
+            if wait:
+                wr = wait.get("reason", "")
+                if wr:
+                    wait_reasons.append(wr)
+            term = c.get("state", {}).get("terminated", {})
+            if term:
+                crash_count += term.get("restartCount", 0)
+                tr = term.get("reason", "")
+                if tr and tr not in wait_reasons:
+                    wait_reasons.append(tr)
+
+        reason_str = ",".join(wait_reasons) if wait_reasons else phase
+        pod_info = {
+            "namespace": ns, "name": name, "phase": phase,
+            "reason": reason_str,
+            "restarts": crash_count,
+        }
+        result["pods"].append(pod_info)
+
+        # 根据严重程度分级
+        if "CrashLoopBackOff" in reason_str or "Error" in reason_str:
+            level = WARNING
+        elif "ImagePullBackOff" in reason_str or "ErrImagePull" in reason_str:
+            level = WARNING
+        elif "Pending" == phase and not wait_reasons:
+            level = INFO
+        else:
+            level = WARNING
+
+        result["issues"].append({
+            "level": level,
+            "item": "Pod {}".format(phase),
+            "detail": "{}/{}/{}: phase={} reason={}".format(
+                cname, ns, name, phase, reason_str),
+        })
+
+    if result["pods"]:
+        result["status"] = WARNING if any(
+            i["level"] in (CRITICAL, WARNING) for i in result["issues"]) else INFO
+
+    return result
+
+
+def check_rancher_health(url, token, cluster_id, cname, deep):
+    """检查 Rancher 管理组件: cattle-system, fleet, capi"""
+    result = {"components": {}, "issues": [], "status": OK}
+    if not deep:
+        return result
+
+    # Rancher 管理命名空间
+    RANCHER_NS = {"cattle-system", "cattle-fleet-local-system",
+                  "cattle-provisioning-capi-system"}
+
+    pods = k8s_list(url, token, cluster_id, "api/v1/pods")
+
+    for p in pods:
+        ns = p["metadata"]["namespace"]
+        if ns not in RANCHER_NS:
+            continue
+        name = p["metadata"]["name"]
+        phase = p["status"].get("phase", "?")
+        csts = p["status"].get("containerStatuses", [])
+        ready = sum(1 for c in csts if c.get("ready"))
+        total = len(csts)
+        restarts = sum(c.get("restartCount", 0) for c in csts)
+
+        healthy = phase == "Running" and ready == total and total > 0
+        key = "{}/{}".format(ns, name)
+        result["components"][key] = {
+            "ready": ready, "total": total,
+            "phase": phase, "restarts": restarts, "healthy": healthy,
+        }
+
+        if not healthy:
+            result["issues"].append({
+                "level": WARNING,
+                "item": "Rancher Pod {}".format(phase),
+                "detail": "{}: {}/{} {}/{}({}) ready".format(
+                    cname, ns, name, ready, total, phase),
+            })
+        if restarts > 5:
+            result["issues"].append({
+                "level": INFO,
+                "item": "Rancher Pod Restarts",
+                "detail": "{}: {}/{} restarts={}".format(
+                    cname, ns, name, restarts),
+            })
+
+    if any(i["level"] in (CRITICAL, WARNING) for i in result["issues"]):
+        result["status"] = WARNING
+
+    return result
+
+
 def check_cni(url, token, cluster_id, cname, deep):
     """检查 CNI: DaemonSet 状态、所有节点覆盖"""
     result = {"cni_type": "unknown", "status": OK, "daemonsets": [], "issues": []}
@@ -745,28 +860,54 @@ def check_workloads(url, token, cluster_id, cname, deep):
 
 
 def check_events(url, token, cluster_id, cname, deep):
-    """检查最近 Warning 事件"""
-    result = {"warnings": [], "issues": [], "status": OK}
+    """检查最近 Warning 事件，特别关注控制平面/etcd"""
+    result = {"warnings": [], "ctrl_warnings": [], "issues": [], "status": OK}
     if not deep:
         return result
 
-    data = k8s_api(url, token, cluster_id, "api/v1/events?limit=100")
+    CTRL_KEYWORDS = {"etcd", "apiserver", "kube-apiserver", "scheduler",
+                     "controller-manager", "kube-controller", "cloud-controller"}
+
+    data = k8s_api(url, token, cluster_id, "api/v1/events?limit=200")
     if not data:
         return result
 
     for e in data.get("items", []):
-        if e.get("type") == "Warning":
-            result["warnings"].append({
-                "namespace": e["metadata"]["namespace"],
-                "name": e["metadata"]["name"],
-                "reason": e.get("reason", "?"),
-                "message": (e.get("message", "") or "")[:120],
-                "time": e.get("lastTimestamp", e.get("eventTime", e["metadata"].get("creationTimestamp", ""))),
+        if e.get("type") != "Warning":
+            continue
+        reason = e.get("reason", "?")
+        msg = (e.get("message", "") or "")[:120]
+        ns = e["metadata"]["namespace"]
+        name = e["metadata"]["name"]
+        evt = {
+            "namespace": ns,
+            "name": name,
+            "reason": reason,
+            "message": msg,
+            "time": e.get("lastTimestamp", e.get("eventTime",
+                    e["metadata"].get("creationTimestamp", ""))),
+        }
+
+        # 控制平面/etcd 相关事件单独追踪
+        is_ctrl = any(kw in (name + msg + reason).lower() for kw in CTRL_KEYWORDS)
+        if is_ctrl:
+            result["ctrl_warnings"].append(evt)
+        else:
+            result["warnings"].append(evt)
+
+    # 控制平面事件优先展示
+    if result["ctrl_warnings"]:
+        result["status"] = WARNING
+        for w in result["ctrl_warnings"][:10]:
+            result["issues"].append({
+                "level": WARNING,
+                "item": "Ctrl Event: {}".format(w["reason"]),
+                "detail": "{} ({})".format(w["message"][:100], cname),
             })
 
     if result["warnings"]:
-        result["status"] = INFO
-        # 只取最近10条不同reason的
+        if result["status"] != WARNING:
+            result["status"] = INFO
         seen = set()
         uniq = []
         for w in result["warnings"]:
@@ -908,6 +1049,16 @@ def check_cluster(url, token, cluster, deep):
     sysc = check_system_components(url, token, cid, cname, deep)
     result["system_components"] = sysc
     all_issues.extend(sysc["issues"])
+
+    # 非 Running Pod
+    nrp = check_non_running_pods(url, token, cid, cname, deep)
+    result["non_running_pods"] = nrp
+    all_issues.extend(nrp["issues"])
+
+    # Rancher 管理组件
+    rh = check_rancher_health(url, token, cid, cname, deep)
+    result["rancher_health"] = rh
+    all_issues.extend(rh["issues"])
 
     # 工作负载
     wl = check_workloads(url, token, cid, cname, deep)
@@ -1146,6 +1297,25 @@ def generate_report(results, version, url, deep):
                    [[h["namespace"], h["name"], h["restarts"], h["phase"]]
                     for h in sysc["high_restarts"][:10]])
 
+        # ── 非 Running Pod ──
+        nrp = r.get("non_running_pods", {})
+        if nrp.get("pods"):
+            _hdr(lines, "🚨 {} — 非 Running Pod".format(r["name"]), 3)
+            _table(lines, ["Namespace", "Name", "Phase", "Reason", "Restarts"],
+                   [[p["namespace"], p["name"][:40], p["phase"], p["reason"], p["restarts"]]
+                    for p in nrp["pods"][:20]])
+
+        # ── Rancher 管理组件 ──
+        rh = r.get("rancher_health", {})
+        if rh.get("components"):
+            _hdr(lines, "🐄 {} — Rancher 管理组件".format(r["name"]), 3)
+            rows = []
+            for key, info in rh["components"].items():
+                icon = "✅" if info["healthy"] else "⚠️"
+                rows.append([key, info["phase"], "{}/{}".format(info["ready"], info["total"]),
+                            info["restarts"], icon])
+            _table(lines, ["组件", "Phase", "Ready", "Restarts", "状态"], rows)
+
         # ── 工作负载 ──
         wl = r.get("workloads", {})
         if wl.get("mismatched"):
@@ -1158,6 +1328,13 @@ def generate_report(results, version, url, deep):
 
         # ── 事件 ──
         ev = r.get("events", {})
+        if ev.get("ctrl_warnings"):
+            _hdr(lines, "🚨 {} — 控制平面/etcd Warning 事件".format(r["name"]), 3)
+            for w in ev["ctrl_warnings"][:10]:
+                lines.append("- 🟡 **[{}]** {}: {}".format(
+                    w["reason"], w["name"][:50],
+                    (w["message"] or "")[:100]))
+            lines.append("")
         if ev.get("warnings"):
             _hdr(lines, "📋 {} — 最近 Warning 事件".format(r["name"]), 3)
             for w in ev["warnings"][:10]:
