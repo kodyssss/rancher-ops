@@ -9,6 +9,8 @@ rancher-ops/
 ├── rbac/          → 角色管理（导出 + 应用）
 ├── mapping/       → 集群结构导出
 ├── project/       → 项目/Namespace 管理
+├── healthcheck/   → 集群巡检
+├── prompts/       → AI 提示词模板
 ├── env.txt.example
 └── .gitignore
 ```
@@ -22,10 +24,16 @@ cp env.txt.example env.txt
 
 ## 典型场景
 
+### 巡检集群健康
+
+```bash
+python3 healthcheck/rancher_healthcheck.py
+python3 healthcheck/rancher_healthcheck.py -o report.md
+```
+
 ### 跨集群迁移 RBAC
 
 ```bash
-# 导出 → 预检 → 创建用户 → 应用
 python3 rbac/rancher_rbac.py -c poc -o rbac.csv
 python3 rbac/rancher_rbac_apply.py --from-csv rbac.csv --map-cluster poc=prod --check-principals
 python3 rbac/rancher_rbac_apply.py --from-csv rbac.csv --map-cluster poc=prod --auto-create-users

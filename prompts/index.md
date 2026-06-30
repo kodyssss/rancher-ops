@@ -12,6 +12,7 @@
 
 | 文件 | 场景 |
 |---|---|
+| [healthcheck.md](./healthcheck.md) | 巡检集群健康状态 |
 | [migrate-rbac.md](./migrate-rbac.md) | 跨集群迁移 RBAC 权限 |
 | [copy-structure.md](./copy-structure.md) | 拷贝项目/Namespace 结构 |
 | [audit-rbac.md](./audit-rbac.md) | 审计 RBAC 权限配置 |
