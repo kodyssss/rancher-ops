@@ -228,80 +228,113 @@ def get_cluster_rbac(url, token, cluster_id):
 # ═══════════════════════════════════════════
 
 def check_control_plane(url, token, cluster_id, cname, deep):
-    """检查控制平面: etcd, scheduler, controller-manager"""
-    result = {"status": OK, "components": {}, "issues": []}
+    """检查控制平面: etcd, apiserver, scheduler, controller-manager + 数量一致性"""
+    result = {"status": OK, "components": {}, "pod_counts": {}, "issues": []}
     if not deep:
         return result
 
-    comps = k8s_api(url, token, cluster_id, "api/v1/componentstatuses")
-    if not comps or not comps.get("items"):
-        # RKE2/K3s 可能 disabled componentstatus，尝试其他方式
-        # 通过检查 kube-system 中 control-plane pods
-        pods = k8s_list(url, token, cluster_id, "api/v1/pods?fieldSelector=spec.nodeName!=")
-        ctrl_pods = defaultdict(lambda: {"ready": 0, "total": 0, "restarts": 0})
-        for p in pods:
-            ns = p["metadata"]["namespace"]
-            name = p["metadata"]["name"]
-            if ns != "kube-system":
-                continue
-            comp = None
-            if name.startswith("etcd-"):
-                comp = "etcd"
-            elif name.startswith("kube-scheduler-"):
-                comp = "scheduler"
-            elif name.startswith("kube-controller-manager-"):
-                comp = "controller-manager"
-            elif name.startswith("cloud-controller-manager-"):
-                comp = "cloud-controller-manager"
-            else:
-                continue
-            csts = p["status"].get("containerStatuses", [])
-            ctrl_pods[comp]["ready"] += sum(1 for c in csts if c.get("ready"))
-            ctrl_pods[comp]["total"] += len(csts)
-            ctrl_pods[comp]["restarts"] += sum(c.get("restartCount", 0) for c in csts)
+    # 控制平面 pod 名称前缀
+    CTRL_PODS = {
+        "etcd":                     "etcd",
+        "kube-apiserver":           "apiserver",
+        "kube-controller-manager":  "controller-manager",
+        "kube-scheduler":           "scheduler",
+    }
 
-        for comp, st in ctrl_pods.items():
-            healthy = st["ready"] == st["total"] and st["total"] > 0
-            result["components"][comp] = "Healthy" if healthy else "Unhealthy({}/{})".format(
-                st["ready"], st["total"])
-            if not healthy:
-                result["issues"].append({
-                    "level": WARNING,
-                    "item": "ControlPlane {}".format(comp),
-                    "detail": "{}: {}/{} ready, restarts={}".format(
-                        cname, st["ready"], st["total"], st["restarts"]),
-                })
-            if st["restarts"] > 10:
-                result["issues"].append({
-                    "level": WARNING,
-                    "item": "ControlPlane {} Restarts".format(comp),
-                    "detail": "{}: {} restarts".format(cname, st["restarts"]),
-                })
+    pods = k8s_list(url, token, cluster_id, "api/v1/pods?fieldSelector=spec.nodeName!=")
+    ctrl_pods = defaultdict(lambda: {"ready": 0, "total": 0, "restarts": 0, "count": 0})
 
-        if not ctrl_pods:
-            result["components"]["control-plane"] = "No pods found"
-    else:
-        for c in comps["items"]:
-            nm = c["metadata"]["name"]
-            for cond in c.get("conditions", []):
-                status = cond.get("status", "Unknown")
-                result["components"][nm] = status
-                if status != "True":
-                    result["issues"].append({
-                        "level": CRITICAL,
-                        "item": "Component {}".format(nm),
-                        "detail": "{}: status={}".format(cname, status),
-                    })
+    for p in pods:
+        ns = p["metadata"]["namespace"]
+        name = p["metadata"]["name"]
+        if ns != "kube-system":
+            continue
+        comp = None
+        for prefix, label in CTRL_PODS.items():
+            if name.startswith(prefix + "-"):
+                comp = label
+                break
+        if not comp and name.startswith("cloud-controller-manager-"):
+            comp = "cloud-controller-manager"
+        if not comp:
+            continue
+        csts = p["status"].get("containerStatuses", [])
+        ctrl_pods[comp]["ready"] += sum(1 for c in csts if c.get("ready"))
+        ctrl_pods[comp]["total"] += len(csts)
+        ctrl_pods[comp]["restarts"] += sum(c.get("restartCount", 0) for c in csts)
+        ctrl_pods[comp]["count"] += 1
 
-    # 整体评级
+    if not ctrl_pods:
+        result["components"]["control-plane"] = "No pods found"
+        result["issues"].append({
+            "level": CRITICAL,
+            "item": "ControlPlane Missing",
+            "detail": "{}: 未发现控制平面 pod".format(cname),
+        })
+        result["status"] = CRITICAL
+        return result
+
+    # 检测期望数量（HA=3, 单节点=1）
+    counts = [st["count"] for st in ctrl_pods.values()]
+    expected = 3 if any(c > 1 for c in counts) else 1
+
+    for comp in sorted(ctrl_pods):
+        st = ctrl_pods[comp]
+        cnt = st["count"]
+        healthy = st["ready"] == st["total"] and st["total"] > 0
+        status_text = "{} pod".format(cnt)
+        if cnt != expected:
+            status_text += " (期望 {})".format(expected)
+
+        result["components"][comp] = "{} {}".format(
+            "✅" if healthy else "⚠️", status_text)
+        result["pod_counts"][comp] = {
+            "count": cnt, "expected": expected,
+            "ready": st["ready"], "total": st["total"]
+        }
+
+        if not healthy:
+            result["issues"].append({
+                "level": CRITICAL,
+                "item": "ControlPlane {} Down".format(comp),
+                "detail": "{}: {}/{} ready, count={}".format(
+                    cname, st["ready"], st["total"], cnt),
+            })
+        elif cnt != expected:
+            result["issues"].append({
+                "level": WARNING,
+                "item": "ControlPlane {} Count".format(comp),
+                "detail": "{}: {} pods (期望 {})".format(cname, cnt, expected),
+            })
+        if st["restarts"] > 10:
+            result["issues"].append({
+                "level": WARNING,
+                "item": "ControlPlane {} Restarts".format(comp),
+                "detail": "{}: {} restarts".format(cname, st["restarts"]),
+            })
+
+    # 检查缺失的组件
+    expected_comps = {"etcd", "apiserver", "controller-manager", "scheduler"}
+    missing = expected_comps - set(ctrl_pods.keys())
+    for m in missing:
+        result["issues"].append({
+            "level": CRITICAL,
+            "item": "ControlPlane {} Missing".format(m),
+            "detail": "{}: 未发现 {} pod".format(cname, m),
+        })
+
+    result["expected_count"] = expected
+    result["ha"] = expected == 3
+
     has_issue = any(i["level"] in (CRITICAL, WARNING) for i in result["issues"])
-    result["status"] = WARNING if has_issue else OK
+    result["status"] = CRITICAL if any(i["level"] == CRITICAL for i in result["issues"]) else (
+        WARNING if has_issue else OK)
 
     return result
 
 
-def check_nodes(url, token, cluster_id, cname, deep):
-    """检查节点: Rancher + k8s API"""
+def check_nodes(url, token, cluster_id, cname, deep, k8s_version=""):
+    """检查节点: Rancher + k8s API + kubelet 版本对比"""
     result = {"nodes": [], "issues": [], "kubelet_versions": set(),
               "kernel_versions": set(), "container_runtimes": set()}
 
@@ -397,6 +430,24 @@ def check_nodes(url, token, cluster_id, cname, deep):
                         "detail": "{} CNI 可能异常 ({})".format(host, cname),
                     })
 
+        # Kubelet 版本偏移检查
+        kubelet_skew = False
+        if k8s_version and kubelet_ver and kubelet_ver != "?" and k8s_version != "?":
+            try:
+                kv_parts = kubelet_ver.replace("v","").split(".")
+                cv_parts = k8s_version.replace("v","").split(".")
+                if len(kv_parts) >= 2 and len(cv_parts) >= 2:
+                    if kv_parts[0] != cv_parts[0] or kv_parts[1] != cv_parts[1]:
+                        kubelet_skew = True
+                        node_issues.append({
+                            "level": WARNING,
+                            "item": "Kubelet Version Skew",
+                            "detail": "{}: kubelet={} vs cluster={}".format(
+                                host, kubelet_ver, k8s_version),
+                        })
+            except:
+                pass
+
         node_info = {
             "hostname": host,
             "state": state,
@@ -412,6 +463,7 @@ def check_nodes(url, token, cluster_id, cname, deep):
             "ready": "Ready" in [c.get("type") for c in n.get("conditions", [])
                                  if c.get("status") == "True" and c.get("type") == "Ready"],
             "k8s_conditions": k8s_conds,
+            "kubelet_skew": kubelet_skew,
         }
 
         result["nodes"].append(node_info)
@@ -834,7 +886,7 @@ def check_cluster(url, token, cluster, deep):
     all_issues.extend(cp["issues"])
 
     # 节点
-    nd = check_nodes(url, token, cid, cname, deep)
+    nd = check_nodes(url, token, cid, cname, deep, k8s_ver)
     result["nodes"] = nd["nodes"]
     result["node_issues"] = nd["issues"]
     result["kubelet_versions"] = list(nd["kubelet_versions"])
@@ -1009,13 +1061,38 @@ def generate_report(results, version, url, deep):
                 ", ".join(r["container_runtimes"])))
             lines.append("")
 
+        # ── Kubelet 状态 ──
+        if r["nodes"]:
+            kubelet_issues = []
+            for n in r["nodes"]:
+                if not n["ready"]:
+                    kubelet_issues.append("🔴 {}: NotReady".format(n["hostname"]))
+                if n.get("kubelet_skew"):
+                    kubelet_issues.append("🟡 {}: kubelet={} vs cluster={}".format(
+                        n["hostname"], n["kubelet"][:25], r["k8s_version"][:25]))
+            if kubelet_issues:
+                for ki in kubelet_issues:
+                    lines.append("- {}".format(ki))
+                lines.append("")
+            elif r["nodes"]:
+                # 所有节点 kubelet 正常
+                versions = r.get("kubelet_versions", [])
+                if len(versions) == 1:
+                    lines.append("✅ Kubelet 状态正常 ({} 节点, 版本 {})".format(
+                        len(r["nodes"]), list(versions)[0][:25]))
+                    lines.append("")
+
         # ── 控制平面 ──
         cp = r.get("control_plane", {})
         if cp.get("components"):
-            _hdr(lines, "⚙️ {} — 控制平面".format(r["name"]), 3)
-            _table(lines, ["组件", "状态"],
-                   [[comp, "✅" if st == "True" or "Healthy" in st else "⚠️ " + st]
-                    for comp, st in cp["components"].items()])
+            ha_label = " (HA x3)" if cp.get("ha") else " (单节点)"
+            _hdr(lines, "⚙️ {} — 控制平面{}".format(r["name"], ha_label), 3)
+            rows = []
+            for comp, st in cp["components"].items():
+                # st 现在是 "✅ X pod" 或 "⚠️ X/Y ready, Z pod"
+                # 直接展示，已经包含状态图标
+                rows.append([comp, st])
+            _table(lines, ["组件", "状态"], rows)
 
         # ── CNI ──
         cni = r.get("cni", {})
