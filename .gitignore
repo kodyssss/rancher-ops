@@ -1,0 +1,16 @@
+# 配置文件（含 token）
+env.txt
+
+# Python
+__pycache__/
+*.pyc
+
+# macOS
+.DS_Store
+
+# 生成的密码文件
+user_passwords.txt
+
+# 导出文件
+*.csv
+*.json
