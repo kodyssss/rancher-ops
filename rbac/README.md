@@ -4,65 +4,85 @@
 
 | 脚本 | 功能 |
 |------|------|
-| `rancher_rbac.py` | 导出 global/cluster/project 三层 RBAC |
-| `rancher_rbac_apply.py` | 批量绑定（读 CSV 按 displayName 匹配） |
-| `rancher_user.py` | **获取目标 Rancher 所有用户清单** |
-| `rancher_rbac_bind.py` | **单用户绑定（传命令行参数）** |
+| `rancher_rbac.py` | 导出源端 RBAC (global/cluster/project 三层) |
+| `rancher_user.py` | 获取目标端所有用户清单 |
+| `rancher_rbac_bind.py` | 单用户绑定 (命令行传参) |
+| `rbac_batch.py` | 批量调用 bind.py (读 CSV 逐行绑定) |
+| `test_user.py` | 快速验证用户 API |
 
-## rancher_user.py — 获取用户
+## 完整工作流
 
-```bash
-python3 rancher_user.py                 # 终端表格
-python3 rancher_user.py -o users.csv    # 导出 CSV
+```
+源 Rancher                          目标 Rancher
+─────────                           ─────────
+
+① rancher_rbac.py                     → rbac.csv
+   rancher_mapping.py                 → mapping.csv
+       │
+② 源 Rancher 下线集群
+       │
+③ 修改 cleanup job → apply
+       │
+                                   ④ Import 集群
+                                   ⑤ create-project + move-ns
+       │
+                                   ⑥ rancher_user.py
+                                      查看用户清单
+       │
+                                   ⑦ rbac_batch.py --csv rbac.csv
+                                      逐条调用 rancher_rbac_bind.py
 ```
 
-输出所有本地用户 + SSO principals 的 displayName、principal_id、类型。
+### 命令汇总
 
-## rancher_rbac_bind.py — 单用户绑定
+```bash
+# === 源端 ===
+python3 rbac/rancher_rbac.py -c [集群名] -o rbac.csv
+python3 mapping/rancher_mapping.py -c [集群名] -o mapping.csv
+
+# === 目标端 ===
+python3 project/rancher_create.py create-project -f mapping.csv
+python3 project/rancher_create.py move-ns -f mapping.csv
+
+# 查看用户
+python3 rbac/rancher_user.py
+python3 rbac/rancher_user.py -o users.csv
+
+# 批量绑定 (先预览)
+python3 rbac/rbac_batch.py --csv rbac.csv --dry-run
+python3 rbac/rbac_batch.py --csv rbac.csv
+```
+
+## rancher_rbac.py
+
+```bash
+python3 rancher_rbac.py                     # 终端表格
+python3 rancher_rbac.py -c 集群名 -o rbac.csv  # CSV
+```
+
+## rancher_user.py
+
+```bash
+python3 rancher_user.py                     # 终端表格
+python3 rancher_user.py -o users.csv        # CSV
+```
+
+## rancher_rbac_bind.py
 
 ```bash
 # 项目角色
-python3 rancher_rbac_bind.py -c poc -u "e-Xiao.Wang4@geely.com" -p Default --role Owner
+python3 rancher_rbac_bind.py -c poc -u "用户名" -p Default --role Owner
 
 # 集群角色
 python3 rancher_rbac_bind.py -c poc -u "admin" --clusterrole "Cluster Owner"
 ```
 
-| 参数 | 说明 |
-|------|------|
-| `-c` | 集群名 |
-| `-u` | 用户 displayName（精确匹配） |
-| `-p` | 项目名（`--role` 时需要） |
-| `--role` | 项目角色: Owner / Member / ReadOnly |
-| `--clusterrole` | 集群角色: Cluster Owner / Member / Admin / Viewer |
-
-### 典型工作流
+## rbac_batch.py
 
 ```bash
-# 1. 获取目标 Rancher 所有用户
-python3 rancher_user.py -o users.csv
-
-# 2. 查看 users.csv，确认用户 displayName
-
-# 3. 逐个绑定（或用脚本循环）
-python3 rancher_rbac_bind.py -c poc -u "e-Xiao.Wang4@geely.com" -p Default --role Owner
-python3 rancher_rbac_bind.py -c poc -u "e-Boran.Yang@geely.com" -p Default --role Member
-python3 rancher_rbac_bind.py -c poc -u "admin" --clusterrole "Cluster Owner"
+python3 rbac_batch.py --csv rbac.csv --dry-run
+python3 rbac_batch.py --csv rbac.csv
+python3 rbac_batch.py --csv rbac.csv --skip-clusterrole  # 只绑项目角色
 ```
 
-## rancher_rbac.py — 导出
-
-```bash
-python3 rancher_rbac.py                         # 终端表格
-python3 rancher_rbac.py -o rbac.csv             # CSV（utf-8-sig）
-python3 rancher_rbac.py -c 集群名               # 限定集群
-```
-
-## rancher_rbac_apply.py — 批量绑定
-
-```bash
-python3 rancher_rbac_apply.py --from-csv rbac.csv --dry-run
-python3 rancher_rbac_apply.py --from-csv rbac.csv
-```
-
-读 CSV 逐行按 displayName 查用户 → 绑定，用户/角色/项目任一缺失则跳过。
+读取 rbac.csv，逐行调用 `rancher_rbac_bind.py`。
