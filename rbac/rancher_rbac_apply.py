@@ -12,18 +12,23 @@ rancher_rbac_apply.py — 从 rbac CSV 批量绑定角色 (支持 global/cluster
 用户缺失处理:
   --check-principals    预检模式：扫描 CSV 所有用户/组，报告目标端存在/缺失
   --auto-create-users   自动创建缺失的本地用户 (随机密码 → user_passwords.txt)
+  --auto-map-users      按 displayName 自动匹配目标端用户，更新 CSV 中的 PRINCIPAL_ID
+                        (配合 --auto-create-users 可自动创建未匹配的本地用户)
 
 用法:
+  # 源端导出
+  python3 rancher_rbac.py -c poc -o rbac.csv
+
   # 预检用户/组是否存在
   python3 rancher_rbac_apply.py --from-csv rbac.csv --check-principals
 
-  # 自动创建缺失本地用户 + 预览
-  python3 rancher_rbac_apply.py --from-csv rbac.csv --auto-create-users --dry-run
+  # 跨 SSO 迁移：自动映射用户 + 创建缺失本地用户
+  python3 rancher_rbac_apply.py --from-csv rbac.csv --auto-map-users --auto-create-users --dry-run
 
-  # 自动创建用户 + 执行绑定
-  python3 rancher_rbac_apply.py --from-csv rbac.csv --auto-create-users
+  # 执行绑定
+  python3 rancher_rbac_apply.py --from-csv rbac.csv --auto-map-users --auto-create-users
 
-  # 执行
+  # 同 SSO 迁移（不需要映射）
   python3 rancher_rbac_apply.py --from-csv rbac.csv
 
   # 跨集群迁移（含集群级绑定）
@@ -306,6 +311,98 @@ def find_local_user_by_name(url, token, name):
         if (u.get("username") or "").lower() == name_lower:
             return u["id"]
     return None
+
+
+def build_target_user_map(url, token):
+    """
+    构建目标 Rancher 用户/组映射表。
+    拉取所有本地用户 + SSO principals，按 displayName/username/loginName 建索引。
+    本地用户优先（不需要 SSO 认证即可绑定）。
+    返回: {name_lower: {"type": "User"|"Group", "principal_id": str, "user_id": str}}
+    """
+    mapping = {}
+
+    # 1. 本地用户（优先级最高）
+    local_users = load_all_users_raw(url, token)
+    for u in local_users:
+        uid = u["id"]
+        for key in (u.get("displayName"), u.get("username")):
+            key = (key or "").strip()
+            if key and key.lower() not in mapping:
+                mapping[key.lower()] = {"type": "User", "principal_id": uid, "user_id": uid}
+
+    # 2. SSO/外部 principals
+    print("# 正在拉取 principals...", file=sys.stderr)
+    principals = api_paginated(url, token, "v3/principals")
+    for p in principals:
+        pid = p["id"]
+        raw_type = p.get("principalType", "user")
+        ptype = "Group" if raw_type == "group" else "User"
+
+        for field in ("displayName", "loginName", "name"):
+            name = (p.get(field) or "").strip()
+            if name and name.lower() not in mapping:
+                mapping[name.lower()] = {"type": ptype, "principal_id": pid, "user_id": pid}
+                break
+
+    return mapping
+
+
+def auto_map_csv_users(rows, target_map):
+    """
+    按 displayName 匹配，就地更新 CSV 行的 PRINCIPAL_ID 和 TYPE。
+    返回 (mapped_rows_detail, unmapped_rows_detail) 用于报告。
+    """
+    mapped = []   # [(user_group, old_pid, old_type, new_pid, new_type)]
+    unmapped = []  # [(user_group, old_type, old_pid)]
+
+    # 先收集唯一用户（去重）
+    seen = set()
+    unique_users = []
+    for row in rows:
+        ug = (row.get("USER_GROUP", "") or row.get("USER/GROUP", "") or row.get("user_group", "")).strip()
+        ptype = (row.get("TYPE", "") or row.get("type", "")).strip()
+        pid = (row.get("PRINCIPAL_ID", "") or row.get("principal_id", "")).strip()
+
+        if ug in ("(无成员)", "-", "") or not ug:
+            continue
+        key = ug.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        unique_users.append((ug, ptype, pid))
+
+    # 逐用户匹配
+    match_cache = {}  # name_lower → match dict or None
+    for ug, old_type, old_pid in unique_users:
+        key = ug.lower()
+        if key in match_cache:
+            match = match_cache[key]
+        else:
+            match = target_map.get(key)
+            match_cache[key] = match
+
+        if match:
+            mapped.append((ug, old_pid, old_type, match["principal_id"], match["type"]))
+        else:
+            unmapped.append((ug, old_type, old_pid))
+
+    # 就地更新所有行
+    for row in rows:
+        ug = (row.get("USER_GROUP", "") or row.get("USER/GROUP", "") or "").strip()
+        if not ug or ug in ("(无成员)", "-"):
+            continue
+        match = match_cache.get(ug.lower())
+        if match:
+            # 更新 CSV 行中的 PID 和 TYPE
+            for k in ("PRINCIPAL_ID", "principal_id"):
+                if k in row:
+                    row[k] = match["principal_id"]
+            for k in ("TYPE", "type"):
+                if k in row:
+                    row[k] = match["type"]
+
+    return mapped, unmapped
 
 
 def check_principals(url, token, rows):
@@ -678,6 +775,8 @@ def main():
                         help="预检模式：检查 CSV 中所有用户/组在目标端是否存在")
     parser.add_argument("--auto-create-users", action="store_true",
                         help="自动创建 CSV 中缺失的本地用户（SSO 用户跳过）")
+    parser.add_argument("--auto-map-users", action="store_true",
+                        help="按 displayName 自动匹配目标端用户，更新 CSV 中的 PRINCIPAL_ID")
     args = parser.parse_args()
 
     url, token = load_env(args.env)
@@ -706,23 +805,82 @@ def main():
         return
 
     # ── 加载用户缓存 ──
-    users_cache = load_local_users(url, token)
+    users_cache = {}
     principal_cache = {}
-
-    # ── 自动创建缺失本地用户 ──
     created_users = {}
-    if args.auto_create_users:
+
+    # ── 用户映射 (--auto-map-users) ──
+    if args.auto_map_users:
+        print("# 正在从目标端拉取用户列表...", file=sys.stderr)
+        target_map = build_target_user_map(url, token)
+        print("# 目标端共 {} 个标识 (displayName/username/loginName)".format(len(target_map)),
+              file=sys.stderr)
+
+        mapped, unmapped = auto_map_csv_users(rows, target_map)
+
+        # 映射报告
+        print()
+        print("=" * 65)
+        print("  用户映射报告 — {}".format(url))
+        print("=" * 65)
+        print("  绑定条目: {} 条".format(mapped_count_total := len(mapped) + len(unmapped)))
+        print("    ✓ 已匹配: {} (直接可用)".format(len(mapped)))
+        print("    ✗ 未匹配: {}".format(len(unmapped)))
+
+        if mapped:
+            print("\n  匹配详情:")
+            for ug, old_pid, old_type, new_pid, new_type in mapped:
+                print("    {}: {} → {} ({})".format(ug, old_pid, new_pid, new_type))
+
+        unmapped_local = []
+        unmapped_sso = []
+        if unmapped:
+            for ug, pt, pid in unmapped:
+                if pid and pid.startswith("user-"):
+                    unmapped_local.append((ug, pt, pid))
+                elif pid and pid != "-":
+                    unmapped_sso.append((ug, pt, pid))
+
+            if unmapped_local:
+                print("\n  未匹配本地用户 (可用 --auto-create-users 自动创建):")
+                for ug, pt, pid in unmapped_local:
+                    print("    - {} ({})".format(ug, pid))
+            if unmapped_sso:
+                print("\n  未匹配 SSO 用户 (需在新 Rancher 登录后重试):")
+                for ug, pt, pid in unmapped_sso:
+                    print("    - {} ({})".format(ug, pid))
+        print("=" * 65)
+        print()
+
+        # 如果也指定了 --auto-create-users，自动创建未匹配的本地用户
+        if args.auto_create_users and unmapped_local:
+            print("# 自动创建 {} 个未匹配本地用户...".format(len(unmapped_local)),
+                  file=sys.stderr)
+            created_users = auto_create_users(url, token, unmapped_local)
+            # 更新对应行的 PRINCIPAL_ID
+            for row in rows:
+                ug = (row.get("USER_GROUP", "") or row.get("USER/GROUP", "") or "").strip()
+                if ug.lower() in created_users:
+                    row["PRINCIPAL_ID"] = created_users[ug.lower()]
+                    row["TYPE"] = "User"
+
+        users_cache = load_local_users(url, token)
+
+    elif args.auto_create_users:
+        # 非映射模式：原逻辑
+        users_cache = load_local_users(url, token)
         print("# 正在检查缺失的本地用户...", file=sys.stderr)
         _, _, missing_local, _ = check_principals(url, token, rows)
         if missing_local:
             print("# 发现 {} 个缺失本地用户，开始自动创建...".format(len(missing_local)),
                   file=sys.stderr)
             created_users = auto_create_users(url, token, missing_local)
-            # 刷新本地用户缓存
             users_cache = load_local_users(url, token)
             print("# 刷新用户缓存完成", file=sys.stderr)
         else:
             print("# 所有用户均存在，无需创建", file=sys.stderr)
+    else:
+        users_cache = load_local_users(url, token)
 
     # ── 执行绑定 ──
     ok = 0
