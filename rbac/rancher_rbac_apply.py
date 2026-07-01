@@ -349,14 +349,23 @@ def build_target_user_map(url, token):
     def _add(name, info):
         nl = name.lower().strip()
         if nl and nl not in mapping:
-            info_with_dn = dict(info)  # 浅拷贝，避免后续修改冲突
-            info_with_dn["display_name"] = name  # 记录原始 displayName
+            info_with_dn = dict(info)
+            info_with_dn["display_name"] = name
             mapping[nl] = info_with_dn
+            # 归一化索引（模糊匹配用）
             nn = normalize_name_for_match(name)
             if nn:
                 if nn not in norm_index:
                     norm_index[nn] = []
                 norm_index[nn].append(info_with_dn)
+
+        # 去 domain 索引：e-Xiao.Wang4@geely.com → e-xiao.wang4
+        base = re.sub(r'@.*$', '', name).strip()
+        bl = base.lower().strip()
+        if bl and bl != nl and bl not in mapping:
+            info_with_dn = dict(info)
+            info_with_dn["display_name"] = name
+            mapping[bl] = info_with_dn
 
     # 1. 本地用户（优先级最高）
     local_users = load_all_users_raw(url, token)
