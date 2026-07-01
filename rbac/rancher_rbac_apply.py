@@ -934,14 +934,13 @@ def main():
 
     # ── 预检模式 ──
     if args.check_principals:
-        # 如果同时指定 --auto-map-users，先做映射再用映射后的数据预检
         if args.auto_map_users:
+            # 直接用模糊匹配结果做预检，不调旧的 check_principals
             print("# 正在从目标端拉取用户列表...", file=sys.stderr)
             exact_map, norm_map = build_target_user_map(url, token)
             print("# 标识: 精确 {} 个, 归一化 {} 个".format(
                 len(exact_map), len(norm_map)), file=sys.stderr)
 
-            # 手动映射
             if args.user_mapping:
                 print("# 加载手动映射: {}...".format(args.user_mapping), file=sys.stderr)
                 with open(args.user_mapping, "r", encoding="utf-8-sig") as f:
@@ -963,21 +962,42 @@ def main():
                                     exact_map[src.lower()] = match
 
             mapped, unmapped, fuzzy = auto_map_csv_users(rows, exact_map, norm_map)
-
-            # 简要映射报告
             total = len(mapped) + len(unmapped)
             exact_count = len(mapped) - len(fuzzy)
-            print("\n  映射: 总计 {} 条, 精确 {}, 模糊 {}, 未匹配 {}".format(
-                total, exact_count, len(fuzzy), len(unmapped)), file=sys.stderr)
-            if fuzzy:
-                for ug, _, _, _, _, _ in fuzzy:
-                    print("    ~ {} (模糊)".format(ug), file=sys.stderr)
-            if unmapped:
-                for ug, _, _ in unmapped:
-                    print("    ✗ {} (未匹配)".format(ug), file=sys.stderr)
-            print()
 
-        check_principals(url, token, rows)
+            # 映射 → 新 PID 预检报告
+            print()
+            print("=" * 65)
+            print("  Principal 预检报告 (模糊匹配) — {}".format(url))
+            print("=" * 65)
+            print("  绑定条目: {}".format(total))
+            print("    ✓ 精确匹配: {} (PID 已更新为目标端真实 ID, 直接可绑定)".format(exact_count))
+            if fuzzy:
+                print("    ~ 模糊匹配: {} (归一化后匹配, PID 已更新)".format(len(fuzzy)))
+                for ug, old_pid, _, new_pid, new_type, _ in fuzzy:
+                    # 找出目标端原始 displayName
+                    print("      {}: {} → {} ({})".format(ug, old_pid, new_pid, new_type))
+            if unmapped:
+                unmapped_local = [(ug, pt, pid) for ug, pt, pid in unmapped if pid and pid.startswith("user-")]
+                unmapped_sso = [(ug, pt, pid) for ug, pt, pid in unmapped if pid and not pid.startswith("user-") and pid != "-"]
+                unmapped_other = [(ug, pt, pid) for ug, pt, pid in unmapped if not pid or pid == "-"]
+                print("    ✗ 未匹配: {}".format(len(unmapped)))
+                if unmapped_local:
+                    print("\n  未匹配本地用户 (可用 --auto-create-users 创建):")
+                    for ug, pt, pid in unmapped_local:
+                        print("    - {} ({})".format(ug, pid))
+                if unmapped_sso:
+                    print("\n  未匹配 SSO 用户 (需在新 Rancher 登录后 principal 才会出现):")
+                    for ug, pt, pid in unmapped_sso:
+                        print("    - {} ({})".format(ug, pid))
+                if unmapped_other:
+                    print("\n  无 PRINCIPAL_ID 的条目: {}".format(len(unmapped_other)))
+            else:
+                print("\n  ✅ 所有用户均已映射，可以直接执行绑定。")
+            print("=" * 65)
+            print()
+        else:
+            check_principals(url, token, rows)
         return
 
     # ── 加载用户缓存 ──
