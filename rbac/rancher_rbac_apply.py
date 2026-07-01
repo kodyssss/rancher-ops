@@ -934,6 +934,49 @@ def main():
 
     # ── 预检模式 ──
     if args.check_principals:
+        # 如果同时指定 --auto-map-users，先做映射再用映射后的数据预检
+        if args.auto_map_users:
+            print("# 正在从目标端拉取用户列表...", file=sys.stderr)
+            exact_map, norm_map = build_target_user_map(url, token)
+            print("# 标识: 精确 {} 个, 归一化 {} 个".format(
+                len(exact_map), len(norm_map)), file=sys.stderr)
+
+            # 手动映射
+            if args.user_mapping:
+                print("# 加载手动映射: {}...".format(args.user_mapping), file=sys.stderr)
+                with open(args.user_mapping, "r", encoding="utf-8-sig") as f:
+                    for line in f:
+                        line = line.strip()
+                        if not line or line.startswith("#"):
+                            continue
+                        parts = line.split(",")
+                        if len(parts) >= 2:
+                            src, dst = parts[0].strip(), parts[1].strip()
+                            if src and dst:
+                                match = exact_map.get(dst.lower())
+                                if not match and norm_map:
+                                    nn = normalize_name_for_match(dst)
+                                    candidates = norm_map.get(nn, [])
+                                    if len(candidates) == 1:
+                                        match = candidates[0]
+                                if match:
+                                    exact_map[src.lower()] = match
+
+            mapped, unmapped, fuzzy = auto_map_csv_users(rows, exact_map, norm_map)
+
+            # 简要映射报告
+            total = len(mapped) + len(unmapped)
+            exact_count = len(mapped) - len(fuzzy)
+            print("\n  映射: 总计 {} 条, 精确 {}, 模糊 {}, 未匹配 {}".format(
+                total, exact_count, len(fuzzy), len(unmapped)), file=sys.stderr)
+            if fuzzy:
+                for ug, _, _, _, _, _ in fuzzy:
+                    print("    ~ {} (模糊)".format(ug), file=sys.stderr)
+            if unmapped:
+                for ug, _, _ in unmapped:
+                    print("    ✗ {} (未匹配)".format(ug), file=sys.stderr)
+            print()
+
         check_principals(url, token, rows)
         return
 
