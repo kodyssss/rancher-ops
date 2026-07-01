@@ -263,7 +263,7 @@ def resolve_project_id(url, token, cluster_id, name_or_id):
 
 
 def resolve_principal(url, token, user_group, ptype, users_cache, principal_cache):
-    """将 USER_GROUP 解析为 API 所需参数。返回 (key, value) 或 None"""
+    """将 USER_GROUP 解析为 API 参数。先精确查 → 再去 domain 查。返回 (key, value) 或 None"""
     name_lower = user_group.lower()
     cache_key = "{}:{}:{}".format(ptype, name_lower, url)
 
@@ -277,6 +277,11 @@ def resolve_principal(url, token, user_group, ptype, users_cache, principal_cach
             result = ("userId", users_cache[name_lower])
         else:
             pid = search_principal(url, token, user_group)
+            # 去 domain 兜底: 查 e-Xiao.Wang4（目标端可能是 e-Xiao.Wang4@geely.com）
+            if not pid and "@" in user_group:
+                base = re.sub(r'@.*$', '', user_group).strip()
+                if base:
+                    pid = search_principal(url, token, base)
             if pid:
                 result = ("userPrincipalId", pid)
 
@@ -878,17 +883,23 @@ def apply_project_binding(url, token, cluster_id, project_id, cluster_name, proj
 def resolve_principal_with_create(url, token, user_group, ptype, principal_id,
                                   users_cache, principal_cache, created_users):
     """
-    解析 principal：
-    1. 优先用 PRINCIPAL_ID 直接作为绑定参数
-    2. 否则回退到 displayName 查找
-    3. 如果用户是 auto-created 的，使用新创建的 userId
+    解析 principal（displayName 优先）：
+    1. 已 auto-created 的用户 → 直接用 userId
+    2. displayName 查找（含去 domain 兜底）→ 用目标端真实 ID
+    3. 回退到 CSV 中的 PRINCIPAL_ID（旧 ID，跨 Rancher 可能无效）
     返回 (key, value) 或 (None, None)
     """
     # 如果用户是刚 auto-created 的，直接用新的 userId
     if created_users and user_group.lower() in created_users:
         return ("userId", created_users[user_group.lower()])
 
-    # 优先使用 CSV 中的 PRINCIPAL_ID
+    # 优先 displayName 查找
+    resolved = resolve_principal(url, token, user_group, ptype,
+                                 users_cache, principal_cache)
+    if resolved:
+        return resolved
+
+    # 回退到 CSV 中的 PRINCIPAL_ID
     if principal_id and principal_id != "-":
         if ptype.upper() == "GROUP":
             return ("groupPrincipalId", principal_id)
@@ -896,12 +907,6 @@ def resolve_principal_with_create(url, token, user_group, ptype, principal_id,
             return ("userId", principal_id)
         else:
             return ("userPrincipalId", principal_id)
-
-    # 回退到名称查找
-    resolved = resolve_principal(url, token, user_group, ptype,
-                                 users_cache, principal_cache)
-    if resolved:
-        return resolved
 
     return (None, None)
 
