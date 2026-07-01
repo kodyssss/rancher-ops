@@ -349,12 +349,14 @@ def build_target_user_map(url, token):
     def _add(name, info):
         nl = name.lower().strip()
         if nl and nl not in mapping:
-            mapping[nl] = info
+            info_with_dn = dict(info)  # 浅拷贝，避免后续修改冲突
+            info_with_dn["display_name"] = name  # 记录原始 displayName
+            mapping[nl] = info_with_dn
             nn = normalize_name_for_match(name)
             if nn:
                 if nn not in norm_index:
                     norm_index[nn] = []
-                norm_index[nn].append(info)
+                norm_index[nn].append(info_with_dn)
 
     # 1. 本地用户（优先级最高）
     local_users = load_all_users_raw(url, token)
@@ -390,9 +392,9 @@ def auto_map_csv_users(rows, exact_map, norm_map=None):
     2. 未匹配的尝试模糊匹配（去 domain/分隔符）
     返回 (mapped_rows_detail, unmapped_rows_detail, fuzzy_matches) 用于报告。
     """
-    mapped = []      # [(user_group, old_pid, old_type, new_pid, new_type, "exact"|"fuzzy")]
-    fuzzy = []       # [(user_group, old_pid, old_type, new_pid, new_type)]  -- 模糊匹配的子集
-    unmapped = []    # [(user_group, old_type, old_pid)]
+    mapped = []      # [(ug, old_pid, old_type, new_pid, new_type, src, target_dn)]
+    fuzzy = []       # 模糊匹配的子集
+    unmapped = []    # [(ug, old_type, old_pid)]
 
     # 先收集唯一用户（去重）
     seen = set()
@@ -445,7 +447,8 @@ def auto_map_csv_users(rows, exact_map, norm_map=None):
             match_cache[key] = (None, None)
 
         if match:
-            entry = (ug, old_pid, old_type, match["principal_id"], match["type"], source)
+            target_dn = match.get("display_name", "")
+            entry = (ug, old_pid, old_type, match["principal_id"], match["type"], source, target_dn)
             mapped.append(entry)
             if source == "fuzzy":
                 fuzzy.append(entry)
@@ -965,36 +968,44 @@ def main():
             total = len(mapped) + len(unmapped)
             exact_count = len(mapped) - len(fuzzy)
 
-            # 映射 → 新 PID 预检报告
+            # 映射明细报告
             print()
-            print("=" * 65)
-            print("  Principal 预检报告 (模糊匹配) — {}".format(url))
-            print("=" * 65)
-            print("  绑定条目: {}".format(total))
-            print("    ✓ 精确匹配: {} (PID 已更新为目标端真实 ID, 直接可绑定)".format(exact_count))
-            if fuzzy:
-                print("    ~ 模糊匹配: {} (归一化后匹配, PID 已更新)".format(len(fuzzy)))
-                for ug, old_pid, _, new_pid, new_type, _ in fuzzy:
-                    # 找出目标端原始 displayName
-                    print("      {}: {} → {} ({})".format(ug, old_pid, new_pid, new_type))
+            print("=" * 75)
+            print("  用户映射明细 (--check-principals) — {}".format(url))
+            print("=" * 75)
+            total = len(mapped) + len(unmapped)
+            exact_count = len(mapped) - len(fuzzy)
+            print("  绑定条目: {} | 精确: {} | 模糊: {} | 未匹配: {}".format(
+                total, exact_count, len(fuzzy), len(unmapped)))
+            print()
+
+            if mapped:
+                print("  {:<3} {:<25} {:<25} {:<18} {:<18} {:<8}".format(
+                    "", "源 displayName", "→ 目标 displayName", "旧 PID", "新 PID", "方式"))
+                print("  {:<3} {:<25} {:<25} {:<18} {:<18} {:<8}".format(
+                    "", "─"*25, "─"*25, "─"*18, "─"*18, "─"*8))
+                for ug, old_pid, _, new_pid, new_type, src, target_dn in mapped:
+                    icon = "✓" if src == "exact" else "~"
+                    short_old = (old_pid[:16] + "..") if len(old_pid) > 17 else old_pid
+                    short_new = (new_pid[:16] + "..") if len(new_pid) > 17 else new_pid
+                    print("  {:<3} {:<25} {:<25} {:<18} {:<18} {}".format(
+                        icon, ug[:25], target_dn[:25], short_old, short_new,
+                        "精确" if src == "exact" else "模糊"))
+
             if unmapped:
+                print()
                 unmapped_local = [(ug, pt, pid) for ug, pt, pid in unmapped if pid and pid.startswith("user-")]
                 unmapped_sso = [(ug, pt, pid) for ug, pt, pid in unmapped if pid and not pid.startswith("user-") and pid != "-"]
-                unmapped_other = [(ug, pt, pid) for ug, pt, pid in unmapped if not pid or pid == "-"]
-                print("    ✗ 未匹配: {}".format(len(unmapped)))
+                print("  未匹配 ({})：".format(len(unmapped)))
+                for ug, pt, pid in unmapped:
+                    print("    ✗ {:<25} {:<18} {}".format(ug[:25], pid, pt))
                 if unmapped_local:
-                    print("\n  未匹配本地用户 (可用 --auto-create-users 创建):")
-                    for ug, pt, pid in unmapped_local:
-                        print("    - {} ({})".format(ug, pid))
+                    print("\n  → 本地用户 {} 个，可用 --auto-create-users 创建".format(len(unmapped_local)))
                 if unmapped_sso:
-                    print("\n  未匹配 SSO 用户 (需在新 Rancher 登录后 principal 才会出现):")
-                    for ug, pt, pid in unmapped_sso:
-                        print("    - {} ({})".format(ug, pid))
-                if unmapped_other:
-                    print("\n  无 PRINCIPAL_ID 的条目: {}".format(len(unmapped_other)))
+                    print("  → SSO 用户 {} 个，需在新 Rancher 登录后重试".format(len(unmapped_sso)))
             else:
-                print("\n  ✅ 所有用户均已映射，可以直接执行绑定。")
-            print("=" * 65)
+                print("  ✅ 所有用户均已映射，可以直接执行绑定。")
+            print("=" * 75)
             print()
         else:
             check_principals(url, token, rows)
@@ -1049,51 +1060,42 @@ def main():
 
         # 映射报告
         print()
-        print("=" * 65)
-        print("  用户映射报告 — {}".format(url))
-        print("=" * 65)
+        print("=" * 75)
+        print("  用户映射明细 — {}".format(url))
+        print("=" * 75)
         total = len(mapped) + len(unmapped)
-        print("  绑定条目: {} 条".format(total))
         exact_count = len(mapped) - len(fuzzy)
-        print("    ✓ 精确匹配: {}".format(exact_count))
-        if fuzzy:
-            print("    ~ 模糊匹配: {}".format(len(fuzzy)))
-        print("    ✗ 未匹配: {}".format(len(unmapped)))
-
-        if fuzzy:
-            print("\n  模糊匹配详情:")
-            for ug, old_pid, old_type, new_pid, new_type, _ in fuzzy:
-                print("    {}: {} → {} ({})".format(ug, old_pid, new_pid, new_type))
+        print("  绑定条目: {} | 精确: {} | 模糊: {} | 未匹配: {}".format(
+            total, exact_count, len(fuzzy), len(unmapped)))
+        print()
 
         if mapped:
-            if exact_count > 0:
-                print("\n  精确匹配示例 (前5条):")
-                shown = 0
-                for ug, old_pid, old_type, new_pid, new_type, src in mapped:
-                    if src == "exact":
-                        print("    {}: {} → {} ({})".format(ug, old_pid, new_pid, new_type))
-                        shown += 1
-                        if shown >= 5:
-                            break
+            print("  {:<3} {:<25} {:<25} {:<18} {:<18} {:<8}".format(
+                "", "源 displayName", "→ 目标 displayName", "旧 PID", "新 PID", "方式"))
+            print("  {:<3} {:<25} {:<25} {:<18} {:<18} {:<8}".format(
+                "", "─"*25, "─"*25, "─"*18, "─"*18, "─"*8))
+            for ug, old_pid, _, new_pid, new_type, src, target_dn in mapped:
+                icon = "✓" if src == "exact" else ("~" if src == "fuzzy" else "M")
+                # 截断长 PID
+                short_old = (old_pid[:16] + "..") if len(old_pid) > 17 else old_pid
+                short_new = (new_pid[:16] + "..") if len(new_pid) > 17 else new_pid
+                print("  {:<3} {:<25} {:<25} {:<18} {:<18} {}".format(
+                    icon, ug[:25], target_dn[:25], short_old, short_new,
+                    "精确" if src == "exact" else "模糊"))
 
-        unmapped_local = []
-        unmapped_sso = []
         if unmapped:
-            for ug, pt, pid in unmapped:
-                if pid and pid.startswith("user-"):
-                    unmapped_local.append((ug, pt, pid))
-                elif pid and pid != "-":
-                    unmapped_sso.append((ug, pt, pid))
-
+            print()
+            unmapped_local = [(ug, pt, pid) for ug, pt, pid in unmapped if pid and pid.startswith("user-")]
+            unmapped_sso = [(ug, pt, pid) for ug, pt, pid in unmapped if pid and not pid.startswith("user-") and pid != "-"]
+            if unmapped:
+                print("  未匹配 ({})：".format(len(unmapped)))
+                for ug, pt, pid in unmapped:
+                    print("    ✗ {:<25} {:<18} {}".format(ug[:25], pid, pt))
             if unmapped_local:
-                print("\n  未匹配本地用户 (可用 --auto-create-users 自动创建):")
-                for ug, pt, pid in unmapped_local:
-                    print("    - {} ({})".format(ug, pid))
+                print("\n  → 本地用户 {} 个，可用 --auto-create-users 创建".format(len(unmapped_local)))
             if unmapped_sso:
-                print("\n  未匹配 SSO 用户 (可用 --user-mapping 手动指定映射):")
-                for ug, pt, pid in unmapped_sso:
-                    print("    - {} ({})".format(ug, pid))
-        print("=" * 65)
+                print("  → SSO 用户 {} 个，需在新 Rancher 登录后重试".format(len(unmapped_sso)))
+        print("=" * 75)
         print()
 
         # 如果也指定了 --auto-create-users，自动创建未匹配的本地用户
