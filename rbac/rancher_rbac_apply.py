@@ -272,6 +272,7 @@ def main():
     parser.add_argument("--from-csv", required=True, help="rbac CSV 文件")
     parser.add_argument("-e", "--env", help="env 文件路径")
     parser.add_argument("--dry-run", action="store_true", help="只预览不执行")
+    parser.add_argument("--list-users", action="store_true", help="列出目标端所有用户并退出")
     args = parser.parse_args()
 
     url, token = load_env(args.env)
@@ -287,11 +288,50 @@ def main():
     print("# 用户索引: 精确 {} 个, 去domain {} 个\n".format(len(exact_idx), len(bare_idx)),
           file=sys.stderr)
 
+    if args.list_users:
+        print("目标端用户清单 ({}，精确索引):".format(url))
+        print("-" * 60)
+        for name in sorted(exact_idx.keys()):
+            info = exact_idx[name]
+            print("  {:<40} id={:<20} type={}".format(name[:40], info["id"][:20], info["type"]))
+        print()
+        print("去domain索引 ({}):".format(len(bare_idx)))
+        print("-" * 60)
+        for name in sorted(bare_idx.keys()):
+            info = bare_idx[name]
+            print("  {:<40} id={:<20} type={}".format(name[:40], info["id"][:20], info["type"]))
+        sys.exit(0)
+
     # 缓存
     cluster_cache = {}
     project_cache = {}
     role_cache = {}
     user_cache = {}
+
+    # 先匹配一遍，报告汇总
+    matched_names = set()
+    unmatched_names = set()
+    for row in rows:
+        ug = (row.get("USER_GROUP", "") or row.get("USER/GROUP", "") or "").strip()
+        if not ug or ug in ("(无成员)", "-"):
+            continue
+        if ug.lower() not in user_cache:
+            user_cache[ug.lower()] = find_user(ug, exact_idx, bare_idx)
+        if user_cache[ug.lower()]:
+            matched_names.add(ug)
+        else:
+            unmatched_names.add(ug)
+
+    if matched_names:
+        print("已匹配用户 ({}):".format(len(matched_names)), file=sys.stderr)
+        for n in sorted(matched_names):
+            u = user_cache[n.lower()]
+            print("  ✓ {:<35} → id={} ({})".format(n[:35], u["id"][:16], u["type"]), file=sys.stderr)
+    if unmatched_names:
+        print("未匹配用户 ({}):".format(len(unmatched_names)), file=sys.stderr)
+        for n in sorted(unmatched_names):
+            print("  ✗ {}".format(n), file=sys.stderr)
+    print(file=sys.stderr)
 
     ok = 0
     skip_user = 0
