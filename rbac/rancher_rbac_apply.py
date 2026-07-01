@@ -475,7 +475,7 @@ def auto_create_users(url, token, missing_local):
     # 写密码文件
     if passwords:
         pwd_file = "user_passwords.txt"
-        with open(pwd_file, "w") as f:
+        with open(pwd_file, "w", encoding="utf-8") as f:
             f.write("# 自动创建的用户密码 — {}\n".format(time.strftime("%Y-%m-%d %H:%M:%S")))
             f.write("# 格式: username,display_name,password,user_id\n")
             f.write("# 首次登录后请立即修改密码\n\n")
@@ -693,7 +693,7 @@ def main():
         print("# 集群映射: {}".format(cluster_map), file=sys.stderr)
 
     # 读取 CSV
-    with open(args.from_csv, "r") as f:
+    with open(args.from_csv, "r", encoding="utf-8-sig") as f:
         reader = csv.DictReader(f)
         rows = list(reader)
 

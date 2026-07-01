@@ -356,7 +356,7 @@ def main():
         else:
             # CSV: 流式写入，不占内存
             count = 0
-            with open(args.output, "w") as f:
+            with open(args.output, "w", encoding="utf-8-sig") as f:
                 writer = csv.writer(f)
                 writer.writerow(["CLUSTER", "PROJECT", "NAMESPACE", "LABELS"])
                 rows = list(build_mapping(url, token, cluster_filter))

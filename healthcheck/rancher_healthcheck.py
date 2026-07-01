@@ -1410,7 +1410,7 @@ def main():
     if args.json or (args.output and args.output.endswith(".json")):
         out = generate_json(results, version, url, deep)
         if args.output:
-            with open(args.output, "w") as f:
+            with open(args.output, "w", encoding="utf-8") as f:
                 f.write(out)
             print("# 已输出: {}".format(args.output), file=sys.stderr)
         else:
@@ -1418,7 +1418,7 @@ def main():
     else:
         out = generate_report(results, version, url, deep)
         if args.output:
-            with open(args.output, "w") as f:
+            with open(args.output, "w", encoding="utf-8") as f:
                 f.write(out)
             print("# 已输出: {}".format(args.output), file=sys.stderr)
         else:

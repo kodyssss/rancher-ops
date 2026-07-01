@@ -372,7 +372,7 @@ def main():
             rows.sort(key=lambda r: (
                 {"global": 0, "cluster": 1, "project": 2}.get(r[0], 9),
                 r[1] or "", r[2] or "", r[3] or ""))
-            with open(outfile, "w") as f:
+            with open(outfile, "w", encoding="utf-8-sig") as f:
                 w = csv.writer(f)
                 w.writerow(HEADER)
                 w.writerows(rows)
@@ -384,7 +384,7 @@ def main():
         rows.sort(key=lambda r: (
             {"global": 0, "cluster": 1, "project": 2}.get(r[0], 9),
             r[1] or "", r[2] or "", r[3] or ""))
-        with open(args.output, "w") as f:
+        with open(args.output, "w", encoding="utf-8-sig") as f:
             w = csv.writer(f)
             w.writerow(HEADER)
             w.writerows(rows)

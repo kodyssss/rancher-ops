@@ -330,7 +330,7 @@ def main():
         if use_json:
             # JSON 模式
             try:
-                with open(from_file, "r") as f:
+                with open(from_file, "r", encoding="utf-8") as f:
                     raw = json.load(f)
             except Exception as e:
                 if ext == ".csv" and not args.from_json:
@@ -385,7 +385,7 @@ def main():
 
         if not use_json:
             # CSV 模式
-            with open(from_file, "r") as f:
+            with open(from_file, "r", encoding="utf-8-sig") as f:
                 reader = csv.DictReader(f)
                 raw_rows = list(reader)
             for row in raw_rows:
