@@ -262,6 +262,29 @@ def resolve_role(url, token, role_display, role_id, level):
     return mapped, False
 
 
+def create_user(url, token, display_name):
+    """创建本地用户，返回 (ok, user_id, password)"""
+    import secrets, string
+    password = "".join(secrets.choice(string.ascii_letters + string.digits)
+                       for _ in range(16))
+    username = re.sub(r'[^a-z0-9_]', '', display_name.lower().replace(" ", "_"))
+    if not username:
+        username = "user_imported"
+
+    body = {"username": username, "password": password, "name": display_name, "type": "user"}
+    code, data = api(url, token, "POST", "v3/users", body)
+    if code in (200, 201):
+        return True, data.get("id", ""), password
+    elif code == 409:
+        # 已存在，查找 ID
+        for u in api_paginated(url, token, "v3/users"):
+            if (u.get("displayName") or "").lower() == display_name.lower():
+                return True, u["id"], ""
+        return True, None, ""
+    else:
+        return False, None, data.get("error", str(data))
+
+
 # ═══════════════════════════════════════════
 #  主逻辑
 # ═══════════════════════════════════════════
@@ -273,6 +296,8 @@ def main():
     parser.add_argument("-e", "--env", help="env 文件路径")
     parser.add_argument("--dry-run", action="store_true", help="只预览不执行")
     parser.add_argument("--list-users", action="store_true", help="列出目标端所有用户并退出")
+    parser.add_argument("--auto-create-users", action="store_true",
+                        help="CSV 中不存在的用户自动创建为本地用户（随机密码 → user_passwords.txt）")
     args = parser.parse_args()
 
     url, token = load_env(args.env)
@@ -340,6 +365,7 @@ def main():
     skip_project = 0
     skip_other = 0
     failed = 0
+    created_users = []  # [(name, uid, password)]
 
     for i, row in enumerate(rows, 1):
         level = (row.get("LEVEL", "") or "").strip().lower() or "project"
@@ -363,9 +389,23 @@ def main():
         user = user_cache[ug.lower()]
 
         if not user:
-            skip_user += 1
-            print("  ⏭ 用户不存在: {} (行{})".format(ug, i))
-            continue
+            if args.auto_create_users:
+                print("  🔧 创建本地用户: {}...".format(ug), end=" ", file=sys.stderr)
+                ok_create, uid, pwd = create_user(url, token, ug)
+                if ok_create and uid:
+                    print("OK ({})".format(uid), file=sys.stderr)
+                    user = {"id": uid, "type": "local"}
+                    user_cache[ug.lower()] = user
+                    # 记录密码
+                    created_users.append((ug, uid, pwd))
+                else:
+                    print("FAIL: {}".format(pwd), file=sys.stderr)
+                    skip_user += 1
+                    continue
+            else:
+                skip_user += 1
+                print("  ⏭ 用户不存在: {} (行{})".format(ug, i))
+                continue
 
         # ── 2. 查角色 ──
         cache_key = (role_id_col, role, level)
@@ -450,9 +490,22 @@ def main():
     print("  ⏭ 跳过 (集群不存在): {}".format(skip_cluster))
     print("  ⏭ 跳过 (项目不存在): {}".format(skip_project))
     print("  ⏭ 跳过 (其他): {}".format(skip_other))
+    if created_users:
+        print("  🔧 新建用户: {}".format(len(created_users)))
     if failed:
         print("  ❌ 失败: {}".format(failed))
     print("=" * 50)
+
+    # 写密码文件
+    if created_users:
+        pwd_file = "user_passwords.txt"
+        with open(pwd_file, "w", encoding="utf-8") as f:
+            f.write("# 自动创建的用户密码 — {}\n".format(time.strftime("%Y-%m-%d %H:%M:%S")))
+            f.write("# 格式: display_name,user_id,password\n\n")
+            for name, uid, pwd in created_users:
+                if pwd:
+                    f.write("{},{},{}\n".format(name, uid, pwd))
+        print("\n密码已保存: {} ({} 个用户)".format(pwd_file, len(created_users)), file=sys.stderr)
 
 
 if __name__ == "__main__":
