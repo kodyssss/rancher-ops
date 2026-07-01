@@ -13,7 +13,11 @@ rancher_rbac_apply.py — 从 rbac CSV 批量绑定角色 (支持 global/cluster
   --check-principals    预检模式：扫描 CSV 所有用户/组，报告目标端存在/缺失
   --auto-create-users   自动创建缺失的本地用户 (随机密码 → user_passwords.txt)
   --auto-map-users      按 displayName 自动匹配目标端用户，更新 CSV 中的 PRINCIPAL_ID
-                        (配合 --auto-create-users 可自动创建未匹配的本地用户)
+                        (含模糊匹配：忽略 email domain 和 .-_ 分隔符差异)
+  --user-mapping FILE   手动用户映射 CSV: source_name,target_name（优先于自动匹配）
+
+角色缺失处理:
+  --skip-missing-roles  预检目标端角色，跳过不存在的角色绑定
 
 用法:
   # 源端导出
@@ -22,11 +26,17 @@ rancher_rbac_apply.py — 从 rbac CSV 批量绑定角色 (支持 global/cluster
   # 预检用户/组是否存在
   python3 rancher_rbac_apply.py --from-csv rbac.csv --check-principals
 
-  # 跨 SSO 迁移：自动映射用户 + 创建缺失本地用户
-  python3 rancher_rbac_apply.py --from-csv rbac.csv --auto-map-users --auto-create-users --dry-run
+  # 跨 SSO 迁移：自动映射 + 模糊匹配 + 跳过缺失角色
+  python3 rancher_rbac_apply.py --from-csv rbac.csv \
+      --auto-map-users --auto-create-users --skip-missing-roles --dry-run
+
+  # 带手动映射（模糊匹配不了的边缘情况）
+  python3 rancher_rbac_apply.py --from-csv rbac.csv \
+      --auto-map-users --user-mapping manual_map.csv --auto-create-users
 
   # 执行绑定
-  python3 rancher_rbac_apply.py --from-csv rbac.csv --auto-map-users --auto-create-users
+  python3 rancher_rbac_apply.py --from-csv rbac.csv \
+      --auto-map-users --auto-create-users --skip-missing-roles
 
   # 同 SSO 迁移（不需要映射）
   python3 rancher_rbac_apply.py --from-csv rbac.csv
@@ -313,23 +323,48 @@ def find_local_user_by_name(url, token, name):
     return None
 
 
+def normalize_name_for_match(name):
+    """
+    模糊匹配用：去掉 email 域、分隔符，统一小写。
+    e.Boran.Yang 和 e-Boran.Yang@geely.com 都会变成 eboranyang。
+    """
+    name = re.sub(r'@.*$', '', name)     # 去 email domain
+    name = name.lower()
+    name = re.sub(r'[.\-_\s]', '', name)  # 去分隔符
+    return name
+
+
 def build_target_user_map(url, token):
     """
     构建目标 Rancher 用户/组映射表。
     拉取所有本地用户 + SSO principals，按 displayName/username/loginName 建索引。
     本地用户优先（不需要 SSO 认证即可绑定）。
-    返回: {name_lower: {"type": "User"|"Group", "principal_id": str, "user_id": str}}
+    返回: (exact_map, normalized_map)
+      exact_map: {name_lower: {"type": ..., "principal_id": ..., "user_id": ...}}
+      normalized_map: {normalized_name: [...]}  (一对多，处理冲突)
     """
     mapping = {}
+    norm_index = {}  # normalized_name → [match_info, ...]
+
+    def _add(name, info):
+        nl = name.lower().strip()
+        if nl and nl not in mapping:
+            mapping[nl] = info
+            nn = normalize_name_for_match(name)
+            if nn:
+                if nn not in norm_index:
+                    norm_index[nn] = []
+                norm_index[nn].append(info)
 
     # 1. 本地用户（优先级最高）
     local_users = load_all_users_raw(url, token)
     for u in local_users:
         uid = u["id"]
+        info = {"type": "User", "principal_id": uid, "user_id": uid}
         for key in (u.get("displayName"), u.get("username")):
             key = (key or "").strip()
-            if key and key.lower() not in mapping:
-                mapping[key.lower()] = {"type": "User", "principal_id": uid, "user_id": uid}
+            if key:
+                _add(key, info)
 
     # 2. SSO/外部 principals
     print("# 正在拉取 principals...", file=sys.stderr)
@@ -338,23 +373,26 @@ def build_target_user_map(url, token):
         pid = p["id"]
         raw_type = p.get("principalType", "user")
         ptype = "Group" if raw_type == "group" else "User"
-
+        info = {"type": ptype, "principal_id": pid, "user_id": pid}
         for field in ("displayName", "loginName", "name"):
             name = (p.get(field) or "").strip()
-            if name and name.lower() not in mapping:
-                mapping[name.lower()] = {"type": ptype, "principal_id": pid, "user_id": pid}
-                break
+            if name:
+                _add(name, info)
+                break  # 只用第一个有效字段
 
-    return mapping
+    return mapping, norm_index
 
 
-def auto_map_csv_users(rows, target_map):
+def auto_map_csv_users(rows, exact_map, norm_map=None):
     """
     按 displayName 匹配，就地更新 CSV 行的 PRINCIPAL_ID 和 TYPE。
-    返回 (mapped_rows_detail, unmapped_rows_detail) 用于报告。
+    1. 先精确匹配
+    2. 未匹配的尝试模糊匹配（去 domain/分隔符）
+    返回 (mapped_rows_detail, unmapped_rows_detail, fuzzy_matches) 用于报告。
     """
-    mapped = []   # [(user_group, old_pid, old_type, new_pid, new_type)]
-    unmapped = []  # [(user_group, old_type, old_pid)]
+    mapped = []      # [(user_group, old_pid, old_type, new_pid, new_type, "exact"|"fuzzy")]
+    fuzzy = []       # [(user_group, old_pid, old_type, new_pid, new_type)]  -- 模糊匹配的子集
+    unmapped = []    # [(user_group, old_type, old_pid)]
 
     # 先收集唯一用户（去重）
     seen = set()
@@ -363,7 +401,6 @@ def auto_map_csv_users(rows, target_map):
         ug = (row.get("USER_GROUP", "") or row.get("USER/GROUP", "") or row.get("user_group", "")).strip()
         ptype = (row.get("TYPE", "") or row.get("type", "")).strip()
         pid = (row.get("PRINCIPAL_ID", "") or row.get("principal_id", "")).strip()
-
         if ug in ("(无成员)", "-", "") or not ug:
             continue
         key = ug.lower()
@@ -373,17 +410,45 @@ def auto_map_csv_users(rows, target_map):
         unique_users.append((ug, ptype, pid))
 
     # 逐用户匹配
-    match_cache = {}  # name_lower → match dict or None
+    match_cache = {}   # name_lower → match dict or None
+
     for ug, old_type, old_pid in unique_users:
         key = ug.lower()
         if key in match_cache:
-            match = match_cache[key]
+            match, source = match_cache[key]
+        elif key in exact_map:
+            match = exact_map[key]
+            source = "exact"
+            match_cache[key] = (match, source)
+        elif norm_map:
+            # 模糊匹配
+            nn = normalize_name_for_match(ug)
+            candidates = norm_map.get(nn, [])
+            if len(candidates) == 1:
+                match = candidates[0]
+                source = "fuzzy"
+                match_cache[key] = (match, source)
+            elif len(candidates) > 1:
+                # 多人归一化后冲突，不自动匹配
+                match = None
+                source = None
+                match_cache[key] = (None, None)
+                print("  [WARN] 模糊匹配冲突: {} → {} ({} 个候选人,跳过)".format(
+                    ug, nn, len(candidates)), file=sys.stderr)
+            else:
+                match = None
+                source = None
+                match_cache[key] = (None, None)
         else:
-            match = target_map.get(key)
-            match_cache[key] = match
+            match = None
+            source = None
+            match_cache[key] = (None, None)
 
         if match:
-            mapped.append((ug, old_pid, old_type, match["principal_id"], match["type"]))
+            entry = (ug, old_pid, old_type, match["principal_id"], match["type"], source)
+            mapped.append(entry)
+            if source == "fuzzy":
+                fuzzy.append(entry)
         else:
             unmapped.append((ug, old_type, old_pid))
 
@@ -392,17 +457,16 @@ def auto_map_csv_users(rows, target_map):
         ug = (row.get("USER_GROUP", "") or row.get("USER/GROUP", "") or "").strip()
         if not ug or ug in ("(无成员)", "-"):
             continue
-        match = match_cache.get(ug.lower())
-        if match:
-            # 更新 CSV 行中的 PID 和 TYPE
+        m, _ = match_cache.get(ug.lower(), (None, None))
+        if m:
             for k in ("PRINCIPAL_ID", "principal_id"):
                 if k in row:
-                    row[k] = match["principal_id"]
+                    row[k] = m["principal_id"]
             for k in ("TYPE", "type"):
                 if k in row:
-                    row[k] = match["type"]
+                    row[k] = m["type"]
 
-    return mapped, unmapped
+    return mapped, unmapped, fuzzy
 
 
 def check_principals(url, token, rows):
@@ -535,6 +599,72 @@ def check_principals(url, token, rows):
         print("\n  所有用户/组均可解析，可以直接执行绑定。")
 
     return found_count, missing_count, missing_local, missing_sso
+
+
+def check_roles_exist(url, token, rows):
+    """
+    检查 CSV 中的 ROLE_ID 在目标 Rancher 是否存在。
+    返回 (existing_roles, missing_roles)。
+    """
+    role_ids = set()
+    for row in rows:
+        rid = (row.get("ROLE_ID", "") or row.get("role_id", "")).strip()
+        if rid and rid != "-":
+            role_ids.add(rid)
+
+    if not role_ids:
+        return set(), set()
+
+    print("# 正在检查 {} 个角色在目标端是否存在...".format(len(role_ids)), file=sys.stderr)
+    existing = set()
+    missing = set()
+    role_cache = {}  # cache role lookup results
+
+    for rid in sorted(role_ids):
+        if rid in role_cache:
+            if role_cache[rid]:
+                existing.add(rid)
+            else:
+                missing.add(rid)
+            continue
+
+        # 先查 roleTemplates (project/cluster 级)
+        code, data = api(url, token, "GET", "v3/roleTemplates/{}".format(rid))
+        if code == 200:
+            existing.add(rid)
+            role_cache[rid] = True
+            continue
+
+        # 再查 globalRoles (global 级)
+        code, data = api(url, token, "GET", "v3/globalRoles/{}".format(rid))
+        if code == 200:
+            existing.add(rid)
+            role_cache[rid] = True
+            continue
+
+        missing.add(rid)
+        role_cache[rid] = False
+
+    print()
+    print("=" * 60)
+    print("  角色预检报告")
+    print("=" * 60)
+    print("  总计: {} 个角色".format(len(role_ids)))
+    print("    ✓ 存在: {}".format(len(existing)))
+    print("    ✗ 缺失: {}".format(len(missing)))
+
+    if existing:
+        print("\n  存在的角色:")
+        for rid in sorted(existing):
+            print("    - {}".format(rid))
+    if missing:
+        print("\n  缺失的角色 (可用 --skip-missing-roles 跳过):")
+        for rid in sorted(missing):
+            print("    - {}".format(rid))
+    print("=" * 60)
+    print()
+
+    return existing, missing
 
 
 def auto_create_users(url, token, missing_local):
@@ -777,6 +907,9 @@ def main():
                         help="自动创建 CSV 中缺失的本地用户（SSO 用户跳过）")
     parser.add_argument("--auto-map-users", action="store_true",
                         help="按 displayName 自动匹配目标端用户，更新 CSV 中的 PRINCIPAL_ID")
+    parser.add_argument("--skip-missing-roles", action="store_true",
+                        help="跳过目标端不存在的角色绑定")
+    parser.add_argument("--user-mapping", help="手动用户映射文件 CSV: source_name,target_name")
     args = parser.parse_args()
 
     url, token = load_env(args.env)
@@ -812,25 +945,73 @@ def main():
     # ── 用户映射 (--auto-map-users) ──
     if args.auto_map_users:
         print("# 正在从目标端拉取用户列表...", file=sys.stderr)
-        target_map = build_target_user_map(url, token)
-        print("# 目标端共 {} 个标识 (displayName/username/loginName)".format(len(target_map)),
-              file=sys.stderr)
+        exact_map, norm_map = build_target_user_map(url, token)
+        print("# 精确标识: {} 个, 模糊标识: {} 个 (去 domain/分隔符)".format(
+            len(exact_map), len(norm_map)), file=sys.stderr)
 
-        mapped, unmapped = auto_map_csv_users(rows, target_map)
+        # 手动映射文件
+        manual_map = {}
+        if args.user_mapping:
+            print("# 加载手动映射文件: {}...".format(args.user_mapping), file=sys.stderr)
+            with open(args.user_mapping, "r", encoding="utf-8-sig") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line or line.startswith("#"):
+                        continue
+                    parts = line.split(",")
+                    if len(parts) >= 2:
+                        src = parts[0].strip()
+                        dst = parts[1].strip()
+                        if src and dst:
+                            manual_map[src.lower()] = dst
+            print("# 手动映射: {} 条".format(len(manual_map)), file=sys.stderr)
+
+        # 将手动映射注入到 exact_map
+        if manual_map:
+            for src_name, dst_name in manual_map.items():
+                # 在目标端查找 dst_name
+                match = exact_map.get(dst_name.lower())
+                if not match and norm_map:
+                    nn = normalize_name_for_match(dst_name)
+                    candidates = norm_map.get(nn, [])
+                    if len(candidates) == 1:
+                        match = candidates[0]
+                if match:
+                    exact_map[src_name] = match
+                else:
+                    print("  [WARN] 手动映射目标未找到: {} → {}".format(
+                        src_name, dst_name), file=sys.stderr)
+
+        mapped, unmapped, fuzzy = auto_map_csv_users(rows, exact_map, norm_map)
 
         # 映射报告
         print()
         print("=" * 65)
         print("  用户映射报告 — {}".format(url))
         print("=" * 65)
-        print("  绑定条目: {} 条".format(mapped_count_total := len(mapped) + len(unmapped)))
-        print("    ✓ 已匹配: {} (直接可用)".format(len(mapped)))
+        total = len(mapped) + len(unmapped)
+        print("  绑定条目: {} 条".format(total))
+        exact_count = len(mapped) - len(fuzzy)
+        print("    ✓ 精确匹配: {}".format(exact_count))
+        if fuzzy:
+            print("    ~ 模糊匹配: {}".format(len(fuzzy)))
         print("    ✗ 未匹配: {}".format(len(unmapped)))
 
-        if mapped:
-            print("\n  匹配详情:")
-            for ug, old_pid, old_type, new_pid, new_type in mapped:
+        if fuzzy:
+            print("\n  模糊匹配详情:")
+            for ug, old_pid, old_type, new_pid, new_type, _ in fuzzy:
                 print("    {}: {} → {} ({})".format(ug, old_pid, new_pid, new_type))
+
+        if mapped:
+            if exact_count > 0:
+                print("\n  精确匹配示例 (前5条):")
+                shown = 0
+                for ug, old_pid, old_type, new_pid, new_type, src in mapped:
+                    if src == "exact":
+                        print("    {}: {} → {} ({})".format(ug, old_pid, new_pid, new_type))
+                        shown += 1
+                        if shown >= 5:
+                            break
 
         unmapped_local = []
         unmapped_sso = []
@@ -846,7 +1027,7 @@ def main():
                 for ug, pt, pid in unmapped_local:
                     print("    - {} ({})".format(ug, pid))
             if unmapped_sso:
-                print("\n  未匹配 SSO 用户 (需在新 Rancher 登录后重试):")
+                print("\n  未匹配 SSO 用户 (可用 --user-mapping 手动指定映射):")
                 for ug, pt, pid in unmapped_sso:
                     print("    - {} ({})".format(ug, pid))
         print("=" * 65)
@@ -882,6 +1063,11 @@ def main():
     else:
         users_cache = load_local_users(url, token)
 
+    # ── 角色预检 ──
+    missing_roles = set()
+    if args.skip_missing_roles:
+        existing_roles, missing_roles = check_roles_exist(url, token, rows)
+
     # ── 执行绑定 ──
     ok = 0
     fail = 0
@@ -911,6 +1097,13 @@ def main():
             continue
         if role in ("-", "") or not ug:
             print("  [SKIP] 行{}: 缺少用户或角色 ({} / {})".format(i, ug, role),
+                  file=sys.stderr)
+            skip += 1
+            continue
+
+        # --skip-missing-roles: 跳过不存在的角色
+        if missing_roles and role_id_col in missing_roles:
+            print("  [SKIP] 行{}: 角色不存在 {} ({})".format(i, role_id_col, role),
                   file=sys.stderr)
             skip += 1
             continue
