@@ -422,6 +422,7 @@ def main():
 
         ok = 0
         fail = 0
+        skip = 0
         for item in items:
             cl = item["cluster"]
             pn = item["name"]
@@ -435,6 +436,12 @@ def main():
                     labels.update(cmd_labels)
                 else:
                     labels = cmd_labels
+
+            # move-ns: 跳过未知项目（mapping 输出 (unknown) 等）
+            if action == "move-ns" and pn.lower() in ("(unknown)", "unknown", "", "-"):
+                print("  [SKIP] 项目未知,跳过: cluster={} ns={}".format(cl, ns), file=sys.stderr)
+                skip += 1
+                continue
 
             if args.dry_run:
                 if action == "create-project":
@@ -458,7 +465,7 @@ def main():
             except Exception as e:
                 print("  [ERR] {}: {}".format(item, e), file=sys.stderr)
                 fail += 1
-        print("# 完成: {} 成功, {} 失败".format(ok, fail), file=sys.stderr)
+        print("# 完成: {} 成功, {} 跳过, {} 失败".format(ok, skip, fail), file=sys.stderr)
         return
 
     # ── 单条模式 ──
